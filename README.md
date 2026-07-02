@@ -13,7 +13,7 @@ Dostępne są dwie wersje:
 
 - Python 3.10+
 - [meshcore-proxy](https://github.com/meshcore-dev/meshcore-proxy) — łączy się z Heltec przez USB i wystawia TCP API
-- [meshcore](https://pypi.org/project/meshcore/) — biblioteka Python do komunikacji z meshcore-proxy
+- [meshcore](https://pypi.org/project/meshcore/) ([źródła](https://github.com/meshcore-dev/meshcore_py)) — biblioteka Python do komunikacji z meshcore-proxy
 - Bot Telegram — utwórz przez [@BotFather](https://t.me/BotFather)
 
 ```bash
@@ -103,9 +103,6 @@ Patrz [`config.example.yaml`](config.example.yaml) — zawiera wszystkie klucze 
 
 ## Bezpieczeństwo
 
-- ⚠️ **Nigdy nie commituj `config.yaml`** — zawiera token bota. Plik jest w `.gitignore`.
-- Wszystkie sekrety trzymaj w zmiennych środowiskowych lub `config.yaml` (poza repo).
-- Jeśli token kiedykolwiek wycieknie — natychmiast użyj `/revoke` w [@BotFather](https://t.me/BotFather).
 - Bridge ma wbudowany rate-limiting: domyślnie max 5 wysyłek na 10 sekund. Nie da się zalać sieci mesh spamem z Telegrama.
 
 ## Architektura
