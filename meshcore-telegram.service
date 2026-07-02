@@ -1,0 +1,23 @@
+[Unit]
+Description=MeshCore → Telegram Bridge
+Documentation=https://github.com/meshcore-dev/meshcore.js
+After=meshcore-proxy.service
+Requires=meshcore-proxy.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=$HOME/meshcore-bridge/meshcore-telegram-bridge.py
+WorkingDirectory=$HOME/meshcore-bridge
+Restart=always
+RestartSec=10
+User=%u
+Group=dialout
+
+# Ustaw własne wartości! Wygeneruj token przez @BotFather.
+Environment=TELEGRAM_BOT_TOKEN=TWÓJ_BOT_TOKEN
+Environment=TELEGRAM_CHAT_ID=TWÓJ_CHAT_ID
+
+[Install]
+WantedBy=multi-user.target

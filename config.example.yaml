@@ -1,0 +1,16 @@
+# MeshCore Bridge — przykładowa konfiguracja
+# Skopiuj do config.yaml i wypełnij własnymi danymi.
+# config.yaml NIGDY nie commituj — jest w .gitignore.
+
+telegram:
+  bot_token: "TWÓJ_BOT_TOKEN_OD_BOTFATHER"
+  chat_id: "TWÓJ_CHAT_ID"
+  allowed_users: []  # opcjonalnie: lista chat_id które mogą wydawać komendy
+
+meshcore:
+  connection:
+    type: tcp
+    host: localhost
+    port: 5000
+    auto_reconnect: true
+    max_reconnect_attempts: 0

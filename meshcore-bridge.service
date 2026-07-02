@@ -1,0 +1,20 @@
+[Unit]
+Description=MeshCore <=> Telegram Bridge (v4, FastAPI)
+After=meshcore-proxy.service
+Requires=meshcore-proxy.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=$HOME/meshcore-venv/bin/python3 $HOME/meshcore-bridge/bridge.py
+WorkingDirectory=$HOME/meshcore-bridge
+Restart=always
+RestartSec=10
+User=%u
+Group=dialout
+Environment=MESHCORE_BRIDGE_CONFIG=$HOME/meshcore-bridge/config.yaml
+Environment=LOG_LEVEL=INFO
+
+[Install]
+WantedBy=multi-user.target

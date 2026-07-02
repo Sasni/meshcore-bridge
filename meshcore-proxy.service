@@ -1,0 +1,18 @@
+[Unit]
+Description=MeshCore USB Proxy (Heltec V4)
+Documentation=https://github.com/meshcore-dev/meshcore-proxy
+After=multi-user.target
+
+[Service]
+Type=simple
+# Dostosuj ścieżkę i port szeregowy do swojego urządzenia:
+#   --serial /dev/ttyACM0  (Linux, Heltec przez USB)
+#   --serial /dev/ttyUSB0  (Linux, przez UART)
+ExecStart=$HOME/.local/bin/meshcore-proxy --serial /dev/ttyACM0
+Restart=always
+RestartSec=5
+User=%u
+Group=dialout
+
+[Install]
+WantedBy=multi-user.target

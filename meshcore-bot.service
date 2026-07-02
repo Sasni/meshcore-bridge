@@ -1,0 +1,20 @@
+[Unit]
+Description=MeshCore Bot + Telegram Bridge + Web UI
+Documentation=https://github.com/Sasni/meshcore_bot
+After=meshcore-proxy.service
+Requires=meshcore-proxy.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=$HOME/meshcore-venv/bin/python3 $HOME/meshcore_bot/app.py
+WorkingDirectory=$HOME/meshcore_bot
+Restart=always
+RestartSec=10
+User=%u
+Group=dialout
+Environment=MESHCORE_BOT_CONFIG=$HOME/meshcore_bot/config.yaml
+
+[Install]
+WantedBy=multi-user.target

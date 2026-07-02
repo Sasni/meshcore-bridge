@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Środowisko wirtualne
+.venv/
+venv/
+env/
+meshcore-venv/
+
+# Konfiguracja z sekretami — NIGDY nie commituj
+config.yaml
+*.secret
+*.private
+
+# Stan bridge'a (przetrwa restart, ale nie powinien być w repo)
+meshcore-bridge-state.json
+meshcore-bridge-state.json.tmp
+.tg_offset
+.msg_history.json
+.bridge.log
+
+# System plików
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.bak
+
+# IDE
+.vscode/
+.idea/
+
+# Testy
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
