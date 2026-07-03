@@ -8,7 +8,7 @@ Usage:
   python3 bridge.py
 """
 
-import asyncio, json, logging, os, sys, time, hashlib
+import asyncio, json, logging, os, sys, time, hashlib, sqlite3
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -40,6 +40,7 @@ _http: httpx.AsyncClient | None = None
 _tg_offset: int = 0
 _OFFSET_FILE = Path(CONFIG_PATH.parent, ".tg_offset")
 _MSG_FILE = Path(CONFIG_PATH.parent, ".msg_history.json")
+_DB_FILE = Path(CONFIG_PATH.parent, "msg_history.db")  # SQLite full history
 _LOG_FILE = Path(CONFIG_PATH.parent, ".bridge.log")
 _MAX_PERSIST_LOG = 5 * 1024 * 1024  # 5 MB log rotation
 
@@ -59,6 +60,7 @@ def _save_offset(val: int):
     except Exception as e:
         log.warning(f"Blad zapisu offsetu: {e}")
 _mc_ref = None  # MeshCore instance reference
+_last_rx_ts: float = 0.0  # last time we received ANY event or successful ping
 _self_info: dict = {}  # cached SELF_INFO
 _device_info: dict = {}  # cached device query
 _device_info_ts: float = 0.0  # last refresh timestamp
@@ -164,6 +166,75 @@ def _load_msg_file():
     except Exception:
         pass
 
+# ── SQLite message history ────────────────────────────────────
+def _init_db():
+    """Initialize SQLite DB for full message history."""
+    db = sqlite3.connect(str(_DB_FILE))
+    db.execute("CREATE TABLE IF NOT EXISTS messages ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               "ts TEXT NOT NULL,"       # ISO timestamp
+               "dir TEXT NOT NULL,"      # 'in' or 'out'
+               "ch TEXT NOT NULL,"       # 'CH0', 'DM', etc.
+               "sender TEXT NOT NULL,"
+               "text TEXT NOT NULL)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ch ON messages(ch)")
+    db.execute("PRAGMA journal_mode=WAL")  # better concurrency
+    db.commit()
+    db.close()
+
+def _db_insert(direction: str, channel: str, sender: str, text: str):
+    """Insert a message into SQLite history."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        db.execute(
+            "INSERT INTO messages (ts, dir, ch, sender, text) VALUES (?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), direction, channel, sender, text))
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[bridge] DB insert error: {e}", file=sys.stderr)
+
+def _db_search(search: str = "", channel: str = "", limit: int = 100, offset: int = 0) -> list[dict]:
+    """Search message history with optional filters. Returns list of dicts."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        db.row_factory = sqlite3.Row
+        query = "SELECT ts, dir, ch, sender, text FROM messages WHERE 1=1"
+        params: list = []
+        if search:
+            query += " AND (text LIKE ? OR sender LIKE ?)"
+            params.extend([f"%{search}%", f"%{search}%"])
+        if channel:
+            query += " AND ch = ?"
+            params.append(channel)
+        query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = db.execute(query, params).fetchall()
+        db.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[bridge] DB search error: {e}", file=sys.stderr)
+        return []
+
+def _db_count(search: str = "", channel: str = "") -> int:
+    """Count total messages matching filters."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        query = "SELECT COUNT(*) FROM messages WHERE 1=1"
+        params: list = []
+        if search:
+            query += " AND (text LIKE ? OR sender LIKE ?)"
+            params.extend([f"%{search}%", f"%{search}%"])
+        if channel:
+            query += " AND ch = ?"
+            params.append(channel)
+        count = db.execute(query, params).fetchone()[0]
+        db.close()
+        return count
+    except Exception:
+        return 0
+
 def _push_msg(direction: str, channel: str, sender: str, text: str):
     """Push a structured message to the chat history with dedup."""
     # Dedup: skip "in" if same text+channel was just sent as "out"
@@ -183,6 +254,7 @@ def _push_msg(direction: str, channel: str, sender: str, text: str):
     if len(_msg_history) > MAX_MSG_HISTORY:
         _msg_history.pop(0)
     _save_msg_file()
+    _db_insert(direction, channel, sender, text)
 
 
 def load_config() -> dict:
@@ -293,7 +365,8 @@ async def send_tg(text: str, chat_id: str = None) -> bool:
 # ── MeshCore handlers ────────────────────────────────────────
 
 async def on_contact_message(mc, event):
-    global _last_sender
+    global _last_sender, _last_rx_ts
+    _last_rx_ts = time.time()
     p = event.payload
     if not isinstance(p, dict):
         return
@@ -317,6 +390,8 @@ async def on_contact_message(mc, event):
 
 
 async def on_channel_message(mc, event):
+    global _last_rx_ts
+    _last_rx_ts = time.time()
     p = event.payload
     if not isinstance(p, dict):
         return
@@ -349,6 +424,8 @@ async def on_channel_message(mc, event):
 
 async def on_ack(mc, event):
     """Track acknowledgements from repeaters for sent messages."""
+    global _last_rx_ts
+    _last_rx_ts = time.time()
     p = event.payload
     if isinstance(p, dict):
         key = p.get("from", "")[:8]
@@ -365,7 +442,8 @@ async def on_ack(mc, event):
 
 
 async def on_self_info(mc, event):
-    global _self_info
+    global _self_info, _last_rx_ts
+    _last_rx_ts = time.time()
     p = event.payload
     if isinstance(p, dict):
         _self_info = p
@@ -378,6 +456,8 @@ async def on_self_info(mc, event):
 
 
 async def on_advert(mc, event):
+    global _last_rx_ts
+    _last_rx_ts = time.time()
     p = event.payload
     if isinstance(p, dict) and p.get("public_key"):
         prefix = p["public_key"][:12]
@@ -624,6 +704,7 @@ th{color:#8899b0;font-weight:500}
   <a href="/" class="active" data-page="dashboard">Dashboard</a>
   <a href="/chat" data-page="chat">Czat</a>
   <a href="/config" data-page="config">Konfiguracja</a>
+  <a href="/history" data-page="history">Historia</a>
 </div>
 <div id="app">
   <div id="page-dashboard">
@@ -684,6 +765,21 @@ th{color:#8899b0;font-weight:500}
         </div>
       </div>
     </div>
+  </div>
+  <div id="page-history" style="display:none">
+    <h1>📜 Historia wiadomosci</h1>
+    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+      <input id="hist-search" type="text" placeholder="Szukaj..." style="flex:1;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:13px" onkeydown="if(event.key==='Enter')histLoad(0)">
+      <select id="hist-chan" style="padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:13px" onchange="histLoad(0)">
+        <option value="">Wszystkie kanaly</option>
+        <option value="CH0">Kanal 0</option>
+        <option value="CH1">Kanal 1</option>
+        <option value="DM">DM</option>
+      </select>
+      <button onclick="histLoad(0)" style="padding:8px 16px;background:#1e3a5f;border:none;border-radius:8px;color:#66b8ff;font-weight:600;cursor:pointer">Szukaj</button>
+    </div>
+    <div id="hist-results" style="background:#080c14;border:1px solid #1a2434;border-radius:8px;padding:8px;font-size:13px;max-height:70vh;overflow:auto"></div>
+    <div id="hist-pager" style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:13px;color:#8899b0"></div>
   </div>
   <div id="page-config" style="display:none">
     <h1>⚙️ Konfiguracja urzadzenia</h1>
@@ -866,6 +962,36 @@ if(s.radio_cr)document.getElementById('cfg-cr').value=s.radio_cr;}}
 async function setCfg(data){const r=await fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const d=await r.json();alert(JSON.stringify(d.results||d.error));}
 async function loadStats(){const r=await fetch('/api/device/stats');const d=await r.json();document.getElementById('stats-display').textContent=JSON.stringify(d,null,2);}
 async function loadChannels(){const r=await fetch('/api/device/channels');const d=await r.json();document.getElementById('channels-display').textContent=JSON.stringify(d,null,2);}
+// History functions
+let _histPage=0,_histTotal=0;
+async function histLoad(page){
+  _histPage=page||0;
+  const q=document.getElementById('hist-search').value;
+  const ch=document.getElementById('hist-chan').value;
+  const r=await fetch('/api/messages/search?q='+encodeURIComponent(q)+'&ch='+encodeURIComponent(ch)+'&limit=50&offset='+(_histPage*50));
+  if(r.status===401){showLoginAgain();return}
+  const d=await r.json();
+  _histTotal=d.total;
+  histRender(d.messages);
+}
+function histRender(msgs){
+  let h='';
+  msgs.forEach(m=>{
+    const ts=m.ts?m.ts.replace('T',' ').substring(0,19):'?';
+    const me=m.dir==='out';
+    h+='<div style="margin-bottom:6px;padding:6px 8px;border-radius:6px;border:1px solid '+(me?'#1a3a2a':'#1a2a3a')+';background:'+(me?'#0a1a0e':'#0a1218')+'">'+
+      '<span style="font-size:11px;color:#556677">'+esc(ts)+'</span> '+
+      '<span style="color:'+(me?'#66b8ff':'#88cc66')+'">'+(me?'<b>JA</b>':esc(m.sender))+'</span> '+
+      '<span style="color:#556677">['+esc(m.ch)+']</span> '+
+      '<span>'+esc(m.text)+'</span></div>';
+  });
+  document.getElementById('hist-results').innerHTML=h||'<div style="color:#556677;padding:20px;text-align:center">Brak wynikow</div>';
+  const totalPages=Math.ceil(_histTotal/50);
+  let pager='Strona ' + (_histPage+1) + ' z ' + (totalPages||1) + ' (' + _histTotal + ' wiadomosci) ';
+  if(_histPage>0)pager+='<button onclick="histLoad('+(_histPage-1)+')" style="background:#1a2a3a;border:none;color:#66b8ff;padding:4px 10px;border-radius:4px;cursor:pointer">&lt; Wstecz</button> ';
+  if((_histPage+1)*50<_histTotal)pager+='<button onclick="histLoad('+(_histPage+1)+')" style="background:#1a2a3a;border:none;color:#66b8ff;padding:4px 10px;border-radius:4px;cursor:pointer">Dalej &gt;</button>';
+  document.getElementById('hist-pager').innerHTML=pager;
+}
 // SPA navigation
 document.querySelectorAll('.nav a').forEach(a=>{a.addEventListener('click',function(e){e.preventDefault();
 document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('active'));this.classList.add('active');
@@ -875,6 +1001,7 @@ if(page){page.style.display='block'}
 if(this.dataset.page==='dashboard'){load();loadLog();loadDeviceCards();loadContacts();if(_map)setTimeout(()=>_map.invalidateSize(),100)};
 if(this.dataset.page==='chat')chatRefresh();
 if(this.dataset.page==='config'){loadDeviceInfo();loadStats();loadChannels()};
+if(this.dataset.page==='history')histLoad(0);
 })})
 </script>
 </body>
@@ -1091,6 +1218,17 @@ async def start_web():
         if not _rate_check(request, RATE_GET_MAX):
             return JSONResponse({"error": "Too many requests"}, status_code=429)
         return JSONResponse(list(_msg_history))
+
+    @app.get("/api/messages/search")
+    async def api_messages_search(request: Request, q: str = "", ch: str = "",
+                                    limit: int = 100, offset: int = 0):
+        """Full-text search in message history (SQLite)."""
+        if not _rate_check(request, RATE_GET_MAX):
+            return JSONResponse({"error": "Too many requests"}, status_code=429)
+        limit = min(limit, 500)
+        rows = _db_search(search=q, channel=ch, limit=limit, offset=offset)
+        total = _db_count(search=q, channel=ch)
+        return JSONResponse({"total": total, "limit": limit, "offset": offset, "messages": rows})
 
     @app.post("/api/send")
     async def api_send(request: Request):
@@ -1328,9 +1466,13 @@ async def start_web():
 async def main():
     global _http, _mc_ref
     _log("MeshCore <=> Telegram Bridge v5")
+    _init_db()  # SQLite full history
     _load_msg_file()
+    # Migrate existing JSON history into DB
     if _msg_history:
         _log(f"Loaded {len(_msg_history)} chat messages from disk")
+        for m in _msg_history:
+            _db_insert(m["dir"], m["ch"], m["from"], m["text"])
 
     cfg = load_config()
     _validate_config(cfg)
@@ -1377,15 +1519,68 @@ async def main():
 
     # Manual poller: MeshOS 2.0 doesn't fire MESSAGES_WAITING events,
     # so auto-fetch never triggers. Poll directly every 10 seconds.
+    global _last_rx_ts
+    _last_rx_ts = time.time()  # initialize as alive after successful connect
     async def _keep_alive_poller():
+        global _last_rx_ts
         while True:
             await asyncio.sleep(10)
             try:
                 if mc.is_connected:
-                    await mc.commands.get_msg()
+                    r = await mc.commands.get_msg()
+                    if r is not None and r.type.name != "ERROR":
+                        _last_rx_ts = time.time()
             except Exception as e:
                 print(f"[bridge] poller error: {e}", file=sys.stderr)
     asyncio.create_task(_keep_alive_poller())
+
+    # Connection watchdog: if no events for 120s, force reconnect.
+    # After 3 consecutive failed pings → restart proxy (dead pyserial fd).
+    async def _connection_watchdog():
+        global _last_rx_ts
+        TIMEOUT_S = 120
+        MAX_FAILS = 3  # consecutive failed pings before proxy restart
+        fails = 0
+        while True:
+            await asyncio.sleep(30)
+            try:
+                # Active ping — get_time with timeout detects dead TCP
+                r = await asyncio.wait_for(mc.commands.get_time(), timeout=8)
+                if r is not None and r.type.name != "ERROR":
+                    _last_rx_ts = time.time()
+                    fails = 0
+                    continue
+            except Exception as e:
+                _log(f"Watchdog: brak odpowiedzi na ping ({e})")
+
+            fails += 1
+            if time.time() - _last_rx_ts > TIMEOUT_S:
+                if fails >= MAX_FAILS:
+                    _log(f"Watchdog: {fails} nieudanych pingow — restartuje meshcore-proxy")
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "sudo", "/usr/bin/systemctl", "restart", "meshcore-proxy",
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL)
+                        await asyncio.wait_for(proc.wait(), timeout=10)
+                    except Exception as e:
+                        _log(f"Watchdog: restart proxy nieudany: {e}")
+                    await asyncio.sleep(5)  # wait for proxy to start
+                    fails = 0
+
+                _log("Watchdog: polaczenie martwe, wymuszam reconnect")
+                try:
+                    await mc.disconnect()
+                except Exception:
+                    pass
+                try:
+                    await mc.connect()
+                    _last_rx_ts = time.time()
+                    fails = 0
+                    _log("Watchdog: reconnect OK")
+                except Exception as e:
+                    _log(f"Watchdog: reconnect nieudany: {e}")
+    asyncio.create_task(_connection_watchdog())
     _log("Nasluchiwanie...")
 
     # Pre-populate device info cache
