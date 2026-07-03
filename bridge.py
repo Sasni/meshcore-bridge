@@ -64,6 +64,7 @@ _last_rx_ts: float = 0.0  # last time we received ANY event or successful ping
 _self_info: dict = {}  # cached SELF_INFO
 _device_info: dict = {}  # cached device query
 _device_info_ts: float = 0.0  # last refresh timestamp
+_device_contact_count: int = 0  # cached count from device contacts
 _msg_history: list[dict] = []  # structured message history for chat UI
 MAX_MSG_HISTORY = 100
 _rate_limits: dict[str, list[float]] = {}  # ip → list of request timestamps
@@ -786,27 +787,32 @@ th{color:#8899b0;font-weight:500}
     <div class="grid">
       <div class="card">
         <h3>Nazwa</h3>
-        <input id="cfg-name" placeholder="WWR01M" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:8px 0">
+        <div style="font-size:11px;color:#556677;margin-bottom:4px">Nazwa urzadzenia widoczna w sieci MeshCore (max 32 znaki)</div>
+        <input id="cfg-name" placeholder="WWR01M" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
         <button onclick="setCfg({name: document.getElementById('cfg-name').value})">Zapisz</button>
       </div>
       <div class="card">
         <h3>TX Power (dBm)</h3>
-        <input id="cfg-txp" type="number" value="20" min="2" max="22" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:8px 0">
+        <div style="font-size:11px;color:#556677;margin-bottom:4px">Moc nadajnika 2-22 dBm. Wyzsza = dalszy zasieg, wieksze zuzycie baterii</div>
+        <input id="cfg-txp" type="number" value="20" min="2" max="22" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
         <button onclick="setCfg({tx_power: +document.getElementById('cfg-txp').value})">Ustaw</button>
       </div>
       <div class="card">
         <h3>Wspolrzedne</h3>
+        <div style="font-size:11px;color:#556677;margin-bottom:4px">Szerokosc i dlugosc geograficzna (GPS). Do obliczania odleglosci i mapy</div>
         <input id="cfg-lat" type="number" step="0.000001" placeholder="50.1197" style="width:48%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
         <input id="cfg-lon" type="number" step="0.000001" placeholder="20.2789" style="width:48%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
         <button onclick="setCfg({coords:[+document.getElementById('cfg-lat').value,+document.getElementById('cfg-lon').value]})">Zapisz</button>
       </div>
       <div class="card">
         <h3>PIN urzadzenia</h3>
+        <div style="font-size:11px;color:#556677;margin-bottom:4px">Kod PIN do parowania BLE. Chroni przed nieautoryzowanym dostepem przez Bluetooth</div>
         <input id="cfg-pin" type="password" placeholder="******" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:8px 0">
         <button onclick="setCfg({devicepin: document.getElementById('cfg-pin').value})">Ustaw PIN</button>
       </div>
       <div class="card" style="grid-column:1/-1">
         <h3>Radio</h3>
+        <div style="font-size:11px;color:#556677;margin-bottom:8px">Parametry radia LoRa. Wszystkie urzadzenia w sieci musza miec te same ustawienia!</div>
         <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px">
           <div><label style="font-size:12px;color:#8899b0">Czest. (MHz)</label><input id="cfg-freq" type="number" step="0.001" value="869.618" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
           <div><label style="font-size:12px;color:#8899b0">BW (kHz)</label><input id="cfg-bw" type="number" step="0.1" value="62.5" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
@@ -820,6 +826,7 @@ th{color:#8899b0;font-weight:500}
       </div>
       <div class="card">
         <h3>Telemetria</h3>
+        <div style="font-size:11px;color:#556677;margin-bottom:8px">Czestotliwosc wysylania danych. 0=OFF, 3=najczesciej</div>
         <label style="font-size:12px;color:#8899b0">Mode Base</label>
         <select id="cfg-tmb" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0"><option value="0">0 - OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select>
         <label style="font-size:12px;color:#8899b0">Mode Loc</label>
@@ -834,6 +841,7 @@ th{color:#8899b0;font-weight:500}
       </div>
       <div class="card">
         <h3>Zaawansowane</h3>
+        <div style="font-size:11px;color:#556677;margin-bottom:8px">Opcje dla zaawansowanych. Zmieniaj tylko jesli wiesz co robisz.</div>
         <label style="font-size:12px;color:#8899b0">Multi ACKs <span style="color:#556;font-weight:normal">(wysyla 2 potwierdzenia zamiast 1 — zwieksza szanse dotarcia ACK)</span></label>
         <input id="cfg-macks" type="checkbox" value="1" style="margin:4px 0;accent-color:#66b8ff">
         <button onclick="setCfg({multi_acks:document.getElementById('cfg-macks').checked?1:0})">Ustaw</button>
@@ -846,6 +854,7 @@ th{color:#8899b0;font-weight:500}
       </div>
       <div class="card">
         <h3>Akcje</h3>
+        <div style="font-size:11px;color:#556677;margin-bottom:8px">Operacje na urzadzeniu</div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
           <button onclick="fetch('/api/device/advert',{method:'POST'}).then(r=>r.json()).then(d=>alert(d.ok?'Advert wyslany':'Blad'))">Wyslij Advert</button>
           <button onclick="if(confirm('Restartowac Helteca?'))fetch('/api/device/reboot',{method:'POST'}).then(r=>r.json()).then(d=>alert(d.ok?'Restart...':'Blad'))" style="background:#ef4444">Restart</button>
@@ -874,7 +883,8 @@ function esc(s){return String(s).replace(/[&<>"']/g,function(m){return{'&':'&amp
 async function load(){const r=await fetch('/api/status');if(r.status===401){showLoginAgain();return};if(!r.ok)return;const d=await r.json();
 document.getElementById('stats').innerHTML=
   `<div class="card"><div class="val"><span class="status-dot ${d.connected?'dot-green':'dot-red'}"></span>${d.connected?'Polaczony':'Rozlaczony'}</div><div class="lbl">Status</div></div>`+
-  `<div class="card"><div class="val">${esc(d.contacts)}</div><div class="lbl">Kontakty</div></div>`+
+  `<div class="card"><div class="val">${esc(d.device_contacts||0)}</div><div class="lbl">Kontakty (urządzenie)</div></div>`+
+  `<div class="card"><div class="val">${esc(d.contacts)}</div><div class="lbl">Kontakty (cache DM)</div></div>`+
   `<div class="card"><div class="val">${esc(d.nodes)}</div><div class="lbl">Widziane nody</div></div>`;
 const n=document.getElementById('nodes');
 n.innerHTML='<tr><th>Node</th><th>Widziany</th><th>Odleglosc</th></tr>';
@@ -1030,7 +1040,8 @@ def build_status(mc) -> dict:
         nodes_with_dist.append(nd)
     return {
         "connected": mc and mc.is_connected,
-        "contacts": len(_contact_cache),
+        "contacts": len(_contact_cache),        # from DM events (cache)
+        "device_contacts": _device_contact_count,  # from device CMD_GET_CONTACTS
         "nodes": len(_seen_nodes),
         "node_list": node_list,
         "node_data": {p: d for p, d in zip(node_list, nodes_with_dist)},
@@ -1163,12 +1174,14 @@ async def start_web():
 
     @app.get("/api/device/contacts")
     async def api_device_contacts():
+        global _device_contact_count
         if not _mc_ref:
             return JSONResponse({"error": "Not connected"})
         try:
             r = await asyncio.wait_for(_mc_ref.commands.get_contacts(), timeout=10)
             if r.type.name != "ERROR":
                 contacts = r.payload or {}
+                _device_contact_count = len(contacts)
                 my_lat = _self_info.get("adv_lat")
                 my_lon = _self_info.get("adv_lon")
                 result = []
@@ -1178,7 +1191,11 @@ async def start_web():
                     lon = c.get("adv_lon")
                     dist = None
                     if lat is not None and lon is not None and my_lat is not None and my_lon is not None:
-                        dist = _haversine(my_lat, my_lon, lat, lon)
+                        # Ignore coordinates near (0,0) — GPS not locked
+                        if abs(lat) < 0.001 and abs(lon) < 0.001:
+                            dist = None
+                        else:
+                            dist = _haversine(my_lat, my_lon, lat, lon)
                     last_ts = c.get("lastmod")  # our clock — when we received it
                     adv_ts = c.get("last_advert")  # remote clock — may drift
                     last_str = _fmt_ts(last_ts)
@@ -1468,11 +1485,12 @@ async def main():
     _log("MeshCore <=> Telegram Bridge v5")
     _init_db()  # SQLite full history
     _load_msg_file()
-    # Migrate existing JSON history into DB
-    if _msg_history:
-        _log(f"Loaded {len(_msg_history)} chat messages from disk")
+    # Migrate existing JSON history into DB (only if DB is empty)
+    if _msg_history and _db_count() == 0:
+        _log(f"Migruje {len(_msg_history)} wiadomosci z JSON do SQLite...")
         for m in _msg_history:
             _db_insert(m["dir"], m["ch"], m["from"], m["text"])
+        _log("Migracja zakonczona")
 
     cfg = load_config()
     _validate_config(cfg)
@@ -1584,12 +1602,19 @@ async def main():
     _log("Nasluchiwanie...")
 
     # Pre-populate device info cache
-    global _device_info_ts
+    global _device_info_ts, _device_contact_count
     try:
         r = await asyncio.wait_for(mc.commands.send_device_query(), timeout=5)
         if r.type.name != "ERROR":
             _device_info = r.payload
             _device_info_ts = time.time()
+    except Exception:
+        pass
+    # Pre-populate device contact count
+    try:
+        r = await asyncio.wait_for(mc.commands.get_contacts(), timeout=10)
+        if r.type.name != "ERROR" and r.payload:
+            _device_contact_count = len(r.payload)
     except Exception:
         pass
 
