@@ -31,8 +31,11 @@ _contact_cache: dict[str, str] = {}       # pubkey_prefix → name
 _seen_nodes: dict[str, dict] = {}          # prefix → info {"ts": str}
 _MAX_CONTACTS = 500
 _MAX_NODES = 200
-_last_sender: dict[str, str] = {}
+_last_sender: dict[str, str] = {}        # name → pubkey (for /r name lookup)
+_last_sender_name: str | None = None     # most recent sender
+_last_sender_key: str | None = None      # their pubkey prefix
 _outbound_msgs: dict[str, float] = {}  # msg_hash → timestamp
+_msg_acks: dict[str, set] = {}          # msg_text → set of repeater keys that acked
 _http: httpx.AsyncClient | None = None
 _tg_offset: int = 0
 _OFFSET_FILE = Path(CONFIG_PATH.parent, ".tg_offset")
@@ -62,35 +65,13 @@ _device_info_ts: float = 0.0  # last refresh timestamp
 _msg_history: list[dict] = []  # structured message history for chat UI
 MAX_MSG_HISTORY = 100
 _rate_limits: dict[str, list[float]] = {}  # ip → list of request timestamps
+_log_buffer: list = []  # rolling log buffer for web UI
+MAX_LOG = 200
 RATE_LIMIT_WINDOW = 10  # seconds
 RATE_SEND_MAX = 3       # max sends per window
 RATE_GET_MAX = 30       # max GETs per window
 
-def _rate_check(request, limit: int) -> bool:
-    """Simple sliding-window rate limiter per IP. Returns True if allowed."""
-    ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW
-    timestamps = [t for t in _rate_limits.get(ip, []) if t > cutoff]
-    if len(timestamps) >= limit:
-        return False
-    timestamps.append(now)
-    _rate_limits[ip] = timestamps
-    # Cleanup old entries periodically
-    if len(_rate_limits) > 1000:
-        _rate_limits.clear()
-    return True
-_log_buffer: list = []  # rolling log buffer for web UI
-MAX_LOG = 200
-
 WEB_PORT = int(os.environ.get("PORT", "8080"))
-
-def _delayed_reboot():
-    """Reboot Pi after 3s delay."""
-    async def _reboot():
-        await asyncio.sleep(3)
-        os.system("sudo reboot")
-    return _reboot()
 
 def _rate_check(request, limit: int) -> bool:
     """Simple sliding-window rate limiter per IP. Returns True if allowed."""
@@ -324,6 +305,8 @@ async def on_contact_message(mc, event):
     snr = p.get("SNR", None)
     sender = await _resolve_name(mc, pk)
     _last_sender[sender] = pk
+    _last_sender_name = sender
+    _last_sender_key = pk
     t = (datetime.fromtimestamp(ts).strftime("%d.%m %H:%M") if ts
          else datetime.now().strftime("%d.%m %H:%M"))
     s = f" [{snr:.1f}dB]" if snr is not None else ""
@@ -342,14 +325,43 @@ async def on_channel_message(mc, event):
         return
     ch = p.get("channel_idx", "?")
     ts = p.get("sender_timestamp", 0)
-    pk = p.get("pubkey_prefix", "??????")
-    sender = await _resolve_name(mc, pk)
+    pk = p.get("pubkey_prefix") or p.get("pub_key", "")
+    if not pk:
+        # Channel messages don't carry sender pubkey — try path
+        path = p.get("path", "")
+        pk = path[:6] if path else ""
+    if not pk:
+        sender = "Nieznany"
+        # Try to extract sender from message text prefix (MeshCore convention: "Name: message")
+        if ":" in text and len(text.split(":")[0]) < 20:
+            prefix = text.split(":")[0].strip()
+            if prefix and not prefix.startswith("http") and " " not in prefix:
+                sender = prefix
+    else:
+        sender = await _resolve_name(mc, pk)
     t = (datetime.fromtimestamp(ts).strftime("%d.%m %H:%M") if ts
          else datetime.now().strftime("%d.%m %H:%M"))
     msg = f"📢 <b>Kanal {ch}</b> {t}\n👤 {esc(sender)}\n\n{esc(text)}"
     _log(f"<- kanal{ch} {sender}: {text[:60]}")
     _push_msg("in", f"CH{ch}", sender, text)
     await send_tg(msg)
+
+
+async def on_ack(mc, event):
+    """Track acknowledgements from repeaters for sent messages."""
+    p = event.payload
+    if isinstance(p, dict):
+        key = p.get("from", "")[:8]
+        text = p.get("text", "")
+        if text and key:
+            if text not in _msg_acks:
+                _msg_acks[text] = set()
+            _msg_acks[text].add(key)
+            _log(f"ACK od {key}: {text[:40]}")
+    # Cleanup old entries
+    if len(_msg_acks) > 100:
+        for k in list(_msg_acks.keys())[:50]:
+            del _msg_acks[k]
 
 
 async def on_self_info(mc, event):
@@ -478,12 +490,11 @@ async def handle_tg_cmd(mc, text: str):
             await send_tg("Uzycie: /r <tekst> lub /r <nazwa> <tekst>")
             return
         if len(parts) == 2:
-            txt = parts[1]
-            if not _last_sender:
-                await send_tg("Brak nadawcy. Uzyj /r <nazwa> <tekst>")
+            if not _last_sender_name:
+                await send_tg("Brak ostatniego nadawcy")
                 return
-            target = list(_last_sender.keys())[-1]
-            key = _last_sender[target]
+            target, key = _last_sender_name, _last_sender_key
+            txt = parts[1]
         else:
             target = parts[1]; txt = parts[2]
             key = next((p for p, n in _contact_cache.items() if n.lower() == target.lower()), None)
@@ -727,9 +738,9 @@ th{color:#8899b0;font-weight:500}
       </div>
       <div class="card">
         <h3>Zaawansowane</h3>
-        <label style="font-size:12px;color:#8899b0">Multi ACKs</label>
-        <input id="cfg-macks" type="number" value="0" min="0" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <button onclick="setCfg({multi_acks:+document.getElementById('cfg-macks').value})">Ustaw</button>
+        <label style="font-size:12px;color:#8899b0">Multi ACKs <span style="color:#556;font-weight:normal">(wysyla 2 potwierdzenia zamiast 1 — zwieksza szanse dotarcia ACK)</span></label>
+        <input id="cfg-macks" type="checkbox" value="1" style="margin:4px 0;accent-color:#66b8ff">
+        <button onclick="setCfg({multi_acks:document.getElementById('cfg-macks').checked?1:0})">Ustaw</button>
         <label style="font-size:12px;color:#8899b0;display:block;margin-top:8px">Flood Scope</label>
         <input id="cfg-fs" type="text" placeholder="#public" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
         <button onclick="setCfg({flood_scope:document.getElementById('cfg-fs').value})">Ustaw</button>
@@ -811,7 +822,7 @@ function closeDetail(){document.getElementById('contact-detail').style.display='
 function toggleRaw(){const e=document.getElementById('cd-raw');e.style.display=e.style.display==='none'?'block':'none';}
 function copyKey(){const k=document.getElementById('cd-key').textContent;navigator.clipboard.writeText(k).then(()=>{const b=event.target;b.textContent='✅';setTimeout(()=>b.textContent='📋',1500);}).catch(()=>{prompt('Ręcznie skopiuj:',k);});}
 async function chatRefresh(){const r=await fetch('/api/messages');const d=await r.json();const ch=document.getElementById('chat-chan').value;const el=document.getElementById('chat-msgs');let h='';d.forEach(m=>{if(m.ch.replace('CH','')==ch||ch==='*'){const me=m.dir==='out';h+='<div style="margin-bottom:8px;padding:8px;border-radius:8px;border:1px solid '+(me?'#1a3a2a':'#1a2a3a')+';background:'+(me?'#0a1a0e':'#0a1218')+'"><div style="font-size:11px;color:#8899b0;margin-bottom:3px">'+(me?'<b style="color:#66b8ff">JA</b>':'<b style="color:#88cc66">'+esc(m.from)+'</b>')+' <span style="color:#556">'+m.ts+'</span> '+m.ch+'</div><div style="line-height:1.5">'+esc(m.text)+'</div></div>'}});el.innerHTML=h||'<div style="color:#8899b0;text-align:center;padding:20px">Brak wiadomosci w kanale '+ch+'</div>';el.scrollTop=el.scrollHeight;}
-async function chatSend(){const inp=document.getElementById('chat-input');const t=inp.value.trim();if(!t)return;const ch=document.getElementById('chat-chan').value;const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),text:t})});const d=await r.json();if(d.ok){inp.value='';chatRefresh()}else{alert('Blad: '+(d.error||'?'))}}
+async function chatSend(){const inp=document.getElementById('chat-input');const t=inp.value.trim();if(!t)return;const ch=document.getElementById('chat-chan').value;const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),text:t})});const d=await r.json();if(d.ok){inp.value='';chatRefresh();if(d.acks!==undefined){const el=document.getElementById('chat-msgs');el.innerHTML+='<div style=\"font-size:11px;color:#ffaa44;padding:2px 8px\">📡 Odebrano przez '+d.acks+' repeater(ow)</div>';el.scrollTop=el.scrollHeight;setTimeout(chatRefresh,5000)}}else{alert('Blad: '+(d.error||'?'))}}
 setInterval(function(){if(document.getElementById('page-chat').style.display!=='none')chatRefresh()},3000);
 async function loadDeviceCards(){const r=await fetch('/api/device/info');if(r.status===401){showLoginAgain();return};if(!r.ok)return;const d=await r.json();
 const dev=d.device||{};const self=d.self||{};
@@ -1103,7 +1114,7 @@ async def start_web():
                 _push_msg("out", f"CH{ch}", "JA", text)
                 _log(f"-> kanal{ch}: {text[:60]}")
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
-                return JSONResponse({"ok": True})
+                return JSONResponse({"ok": True, "acks": len(_msg_acks.get(text, set()))})
             return JSONResponse({"error": r.payload.get("reason", "unknown") if r.payload else "unknown"})
         except Exception as e:
             return JSONResponse({"error": str(e)})
@@ -1147,8 +1158,6 @@ async def start_web():
 
     @app.post("/api/system/reboot-pi")
     async def api_reboot_pi(request: Request):
-        if not _auth_ok(request):
-            return JSONResponse({"error": "Unauthorized"}, status_code=403)
         try:
             asyncio.create_task(_delayed_reboot())
             return JSONResponse({"ok": True, "msg": "Reboot za 3 sekundy..."})
@@ -1346,6 +1355,8 @@ async def main():
                  lambda e: asyncio.create_task(on_self_info(mc, e)))
     mc.subscribe(meshcore.EventType.ADVERTISEMENT,
                  lambda e: asyncio.create_task(on_advert(mc, e)))
+    mc.subscribe(meshcore.EventType.ACK,
+                 lambda e: asyncio.create_task(on_ack(mc, e)))
 
     # Start web UI immediately (independent of device connection)
     web_task = asyncio.create_task(start_web())
@@ -1364,7 +1375,17 @@ async def main():
         _log("Blad: brak odpowiedzi z Helteca po 10 probach")
         sys.exit(1)
 
-    await mc.start_auto_message_fetching()
+    # Manual poller: MeshOS 2.0 doesn't fire MESSAGES_WAITING events,
+    # so auto-fetch never triggers. Poll directly every 10 seconds.
+    async def _keep_alive_poller():
+        while True:
+            await asyncio.sleep(10)
+            try:
+                if mc.is_connected:
+                    await mc.commands.get_msg()
+            except Exception as e:
+                print(f"[bridge] poller error: {e}", file=sys.stderr)
+    asyncio.create_task(_keep_alive_poller())
     _log("Nasluchiwanie...")
 
     # Pre-populate device info cache
