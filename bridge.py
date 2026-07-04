@@ -265,13 +265,28 @@ def _db_insert_packet(sender: str, sender_key: str, text: str, ch: str,
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (datetime.now().isoformat(), sender, sender_key, text[:200] if text else "",
              ch, path, path_hops, snr, rssi, raw_payload))
-        db.commit()
         pid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Prune old packets beyond _MAX_PACKETS
+        db.execute(f"DELETE FROM packets WHERE id NOT IN (SELECT id FROM packets ORDER BY id DESC LIMIT {_MAX_PACKETS})")
+        db.commit()
         db.close()
         return pid
     except Exception as e:
         print(f"[bridge] Packet DB insert error: {e}", file=sys.stderr)
         return None
+
+def _db_update_packet_observers(text_prefix: str, count: int, obs_list: str):
+    """Update observers column for packets matching a text prefix."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        escaped = text_prefix.replace("%", "\\%").replace("_", "\\_")
+        db.execute(
+            "UPDATE packets SET observers = ?, observer_list = ? WHERE text LIKE ? ESCAPE '\\'",
+            (count, obs_list, f"{escaped}%"))
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[bridge] Packet observer update error: {e}", file=sys.stderr)
 
 def _db_get_packets(limit: int = 100) -> list[dict]:
     """Get recent packets with observer data."""
@@ -298,8 +313,8 @@ def _push_msg(direction: str, channel: str, sender: str, text: str):
     if direction == "in":
         for i in range(len(_msg_history) - 1, max(len(_msg_history) - 20, -1), -1):
             m = _msg_history[i]
-            if m["ch"] == channel and m["text"] == text:
-                return  # duplicate — skip (echo or multi-repeater relay)
+            if m["ch"] == channel and m["from"] == sender and m["text"] == text:
+                return  # duplicate (same sender+channel+text) — skip multi-repeater relay
     entry = {
         "ts": datetime.now().strftime("%H:%M:%S"),
         "dir": direction,
@@ -459,7 +474,7 @@ async def on_contact_message(mc, event):
     _push_msg("in", "DM", sender, text)
     # Track packet
     path_str = p.get("path", "")
-    path_hops = len(path_str) if path_str else 0
+    path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
     rssi = p.get("RSSI", None)
     _track_packet(sender, pk, text, "DM", path_str, path_hops, snr, rssi)
     await send_tg(msg)
@@ -497,7 +512,7 @@ async def on_channel_message(mc, event):
     _push_msg("in", f"CH{ch}", sender, text)
     # Track packet
     path_str = p.get("path", "")
-    path_hops = len(path_str) if path_str else 0
+    path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
     rssi = p.get("RSSI", None)
     ch_snr = p.get("SNR", None)
     ch_label = f"CH{ch}"
@@ -518,6 +533,12 @@ async def on_ack(mc, event):
                 _msg_acks[text] = set()
             _msg_acks[text].add(key)
             _log(f"ACK od {key}: {text[:40]}")
+            # Update packet observer set — O(1) dict lookup by consistent key
+            msg_key = text[:60]
+            if msg_key in _packet_observers:
+                _packet_observers[msg_key].add(key)
+                observers = _packet_observers[msg_key]
+                _db_update_packet_observers(msg_key, len(observers), ",".join(sorted(observers)))
     # Cleanup old entries
     if len(_msg_acks) > 100:
         for k in list(_msg_acks.keys())[:50]:
@@ -1725,7 +1746,7 @@ async def start_web():
 
     @app.get("/api/packets")
     async def api_packets(request: Request, limit: int = 100):
-        rows = _db_get_packets(limit)
+        rows = _db_get_packets(min(limit, _MAX_PACKETS))
         return JSONResponse({"packets": rows, "total": len(rows)})
 
     @app.get("/api/system")
