@@ -279,7 +279,7 @@ def _db_update_packet_observers(text_prefix: str, count: int, obs_list: str):
     """Update observers column for packets matching a text prefix."""
     try:
         db = sqlite3.connect(str(_DB_FILE))
-        escaped = text_prefix.replace("%", "\\%").replace("_", "\\_")
+        escaped = text_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         db.execute(
             "UPDATE packets SET observers = ?, observer_list = ? WHERE text LIKE ? ESCAPE '\\'",
             (count, obs_list, f"{escaped}%"))
@@ -300,7 +300,10 @@ def _db_get_packets(limit: int = 100) -> list[dict]:
         result = []
         for r in rows:
             d = dict(r)
-            d["raw_payload"] = json.loads(d["raw_payload"]) if d.get("raw_payload") else None
+            try:
+                d["raw_payload"] = json.loads(d["raw_payload"]) if d.get("raw_payload") else None
+            except (json.JSONDecodeError, TypeError):
+                d["raw_payload"] = d.get("raw_payload")  # keep as string if malformed
             result.append(d)
         return result
     except Exception as e:
@@ -664,6 +667,7 @@ async def handle_tg_cmd(mc, text: str):
             else:
                 _log(f"-> kanal{ch}: {txt[:60]}")
                 _push_msg("out", f"CH{ch}", "TG", txt)
+                _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None)
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(txt)}")
         except Exception as e:
             await send_tg(f"Blad: {e}")
@@ -740,8 +744,6 @@ async def tg_poll_loop(mc):
             log.debug(f"TG poll: {e}")
         await asyncio.sleep(2)
 
-
-# ── Web UI (FastAPI) ──────────────────────────────────────────
 
 # ── Web UI (FastAPI) ──────────────────────────────────────────
 
@@ -1308,7 +1310,7 @@ async function loadContacts(){
   const r=await fetch('/api/device/contacts');
   if(r.status===401){showLoginAgain();return}
   const d=await r.json();
-  if(d.contacts){window._cd=d.contacts.slice(0,200);renderContactsTable();}
+  if(d.contacts){window._cd=d.contacts.slice(0,200);sortContacts('last_advert');renderContactsTable();}
 }
 let _sortCol='last_advert',_sortDir=-1;
 function sortContacts(col){if(_sortCol===col)_sortDir*=-1;else{_sortCol=col;_sortDir=1;}
@@ -2012,12 +2014,10 @@ async def main():
 
     # Start auto-fetch: initializes library's internal event reader
     # that dispatches CONTACT_MSG_RECV, CHANNEL_MSG_RECV, ADVERTISEMENT, ACK.
-    # Without this, subscriptions never fire (MeshOS 2.0 bug — MESSAGES_WAITING never sent).
     await mc.start_auto_message_fetching()
     _log("Auto-fetch started, event reader active")
 
-    # Manual poller: MeshOS 2.0 doesn't fire MESSAGES_WAITING events,
-    # so auto-fetch never triggers. Poll directly every 10 seconds.
+    # Safety net poller: in case auto-fetch stalls, poll directly every 10s.
     global _last_rx_ts
     _last_rx_ts = time.time()  # initialize as alive after successful connect
     async def _keep_alive_poller():
