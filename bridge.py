@@ -1652,7 +1652,9 @@ async def start_web():
             return JSONResponse({"error": "Not connected"})
         try:
             r = await _mc_ref.commands.send_advert(flood=False)
-            return JSONResponse({"ok": r.type.name != "ERROR"})
+            ok = r.type.name != "ERROR"
+            _log(f"Advert {'wyslany' if ok else 'BLAD'}")
+            return JSONResponse({"ok": ok})
         except Exception as e:
             return JSONResponse({"error": str(e)})
 
