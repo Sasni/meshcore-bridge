@@ -47,6 +47,7 @@ _MAX_PERSIST_LOG = 5 * 1024 * 1024  # 5 MB log rotation
 # Packet tracking
 _packet_observers: dict[str, set] = {}  # msg_text → set of observer keys that acked
 _MAX_PACKETS = 500
+_send_datagram_fn = None  # set by main() for start_web() API endpoint
 
 def _load_offset() -> int:
     try:
@@ -1567,6 +1568,7 @@ async def start_web():
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
     app = FastAPI(title="MeshCore Bridge")
+    app.state.send_datagram = _send_datagram_fn  # set by main() after init
     app.add_middleware(AuthMiddleware)
     # Store token in app state to avoid closure issues
     app.state.session_token = _session_token
@@ -1764,6 +1766,32 @@ async def start_web():
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
                 return JSONResponse({"ok": True, "acks": len(_msg_acks.get(text, set()))})
             return JSONResponse({"error": r.payload.get("reason", "unknown") if r.payload else "unknown"})
+        except Exception as e:
+            return JSONResponse({"error": str(e)})
+
+    @app.post("/api/send/datagram")
+    async def api_send_datagram(request: Request):
+        if not _rate_check(request, RATE_SEND_MAX):
+            return JSONResponse({"error": "Too many requests"}, status_code=429)
+        if not _mc_ref:
+            return JSONResponse({"error": "Not connected"})
+        try:
+            body = await request.json()
+            ch = int(body.get("channel", 0))
+            data_type = int(body.get("data_type", 0))
+            payload_hex = str(body.get("payload", ""))
+            payload = bytes.fromhex(payload_hex)
+            if not payload:
+                return JSONResponse({"error": "Empty payload"})
+            send_fn = getattr(request.app.state, "send_datagram", None)
+            if not send_fn:
+                return JSONResponse({"error": "Not ready"})
+            r = await send_fn(ch, data_type, payload)
+            if r.type.name != "ERROR":
+                return JSONResponse({"ok": True})
+            return JSONResponse({"error": r.payload.get("reason", "unknown") if r.payload else "unknown"})
+        except ValueError:
+            return JSONResponse({"error": "Invalid hex payload"})
         except Exception as e:
             return JSONResponse({"error": str(e)})
 
@@ -2020,6 +2048,18 @@ async def main():
         return await mc.commands.send(data,
             [meshcore.EventType.MSG_SENT, meshcore.EventType.ERROR])
 
+    async def _send_channel_datagram(channel: int, data_type: int, payload: bytes):
+        """Send binary datagram to channel (CMD_SEND_CHANNEL_DATA 0x3E)."""
+        data = (b"\x3E"
+                + channel.to_bytes(1, "little")
+                + b"\xFF"                         # flood
+                + data_type.to_bytes(2, "little")
+                + payload)
+        return await mc.commands.send(data,
+            [meshcore.EventType.OK, meshcore.EventType.ERROR])
+    global _send_datagram_fn
+    _send_datagram_fn = _send_channel_datagram
+
     mc.subscribe(meshcore.EventType.CONTACT_MSG_RECV,
                  lambda e: asyncio.create_task(on_contact_message(mc, e)))
     mc.subscribe(meshcore.EventType.CHANNEL_MSG_RECV,
@@ -2064,6 +2104,30 @@ async def main():
 
     # Start auto-fetch: initializes library's internal event reader
     # that dispatches CONTACT_MSG_RECV, CHANNEL_MSG_RECV, ADVERTISEMENT, ACK.
+
+    # Monkey-patch: add CHANNEL_DATA_RECV (0x1B) support to reader
+    from meshcore.packets import PacketType
+    if not hasattr(PacketType, "CHANNEL_DATA_RECV"):
+        PacketType.CHANNEL_DATA_RECV = 0x1B  # type: ignore[attr-defined]
+    _orig_handle = mc._reader.handle_rx
+    async def _patched_handle(data: bytearray):
+        if data and data[0] == 0x1B and len(data) >= 9:
+            import io as _io
+            dbuf = _io.BytesIO(data[1:])
+            snr_byte = dbuf.read(1)[0]
+            snr = (snr_byte if snr_byte < 128 else snr_byte - 256) / 4.0
+            dbuf.read(2)  # reserved
+            ch = dbuf.read(1)[0]
+            path_len = dbuf.read(1)[0]
+            data_type = int.from_bytes(dbuf.read(2), "little")
+            data_len = dbuf.read(1)[0]
+            payload = dbuf.read(data_len)
+            _log(f"<- datagram ch{ch} type={data_type} "
+                 f"len={data_len} [{snr:.1f}dB] {payload.hex()[:40]}")
+            return
+        await _orig_handle(data)
+    mc._reader.handle_rx = _patched_handle  # type: ignore[method-assign]
+
     await mc.start_auto_message_fetching()
     _log("Auto-fetch started, event reader active")
 
