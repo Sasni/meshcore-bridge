@@ -1464,14 +1464,15 @@ async function loadPackets(){
     const snr=p.snr!=null?p.snr.toFixed(1)+' dB':'—';
     const obs=p.observers||0;
     const obsList=p.observer_list?p.observer_list.split(',').join(', '):'';
+    const isOut=p.sender==='JA';
     h+='<div class="hist-row">'+
       '<span class="t">'+esc(ts)+'</span>'+
-      '<b style="color:var(--good)">'+esc(p.sender)+'</b>'+
+      '<b style="color:'+(isOut?'var(--accent)':'var(--good)')+'">'+esc(p.sender)+'</b>'+
       ' <span style="color:var(--text-faint)">['+esc(p.ch)+']</span> '+
       '<span style="color:var(--text-dim)">'+esc((p.text||'').substring(0,80))+'</span>'+
       '<div style="margin-top:4px;font-size:11px;color:var(--text-faint)">'+
-      '<span style="color:var(--accent)">Hopy: '+hops+'</span>'+
-      ' · SNR: '+snr+
+      (isOut?'<span style="color:var(--accent)">📤 Wysłane</span>':
+        '<span style="color:var(--accent)">Hopy: '+hops+'</span> · SNR: '+snr)+
       (obs?' · <span style="color:var(--accent)">Obserwatorzy: '+obs+'</span> ('+esc(obsList)+')':'')+
       '</div></div>';
   });
