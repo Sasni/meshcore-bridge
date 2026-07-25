@@ -697,7 +697,7 @@ async def handle_tg_cmd(mc, text: str):
                 return
             _last_sender[target] = key
         try:
-            r = await mc.commands.send_msg(key, txt[:200])
+            r = await _send_dm_ack(mc, key, txt[:200])
             if r.type.name == "ERROR":
                 await send_tg(f"Blad: {r.payload.get('reason','?')}")
             else:
@@ -2007,6 +2007,18 @@ async def main():
     mc = meshcore.MeshCore(conn, debug=(LOG_LEVEL == "DEBUG"),
                             auto_reconnect=True, max_reconnect_attempts=0)
     _mc_ref = mc
+
+    async def _send_dm_ack(dst_key: str, msg: str):
+        """Send DM with need-ack flag (bit 0). ACK comes async via on_ack."""
+        ts = int(time.time())
+        dst_bytes = bytes.fromhex(dst_key)
+        data = (b"\x02\x01"  # CMD_SEND_CONTACT_MSG, flags=0x01 (need_ack)
+                + (0).to_bytes(1, "little")           # attempt
+                + ts.to_bytes(4, "little")            # timestamp
+                + dst_bytes                           # pubkey prefix (6 bytes)
+                + msg.encode("utf-8"))
+        return await mc.commands.send(data,
+            [meshcore.EventType.MSG_SENT, meshcore.EventType.ERROR])
 
     mc.subscribe(meshcore.EventType.CONTACT_MSG_RECV,
                  lambda e: asyncio.create_task(on_contact_message(mc, e)))
