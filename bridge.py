@@ -44,6 +44,10 @@ _DB_FILE = Path(CONFIG_PATH.parent, "msg_history.db")  # SQLite full history
 _LOG_FILE = Path(CONFIG_PATH.parent, ".bridge.log")
 _MAX_PERSIST_LOG = 5 * 1024 * 1024  # 5 MB log rotation
 
+# Packet tracking
+_packet_observers: dict[str, set] = {}  # msg_text → set of observer keys that acked
+_MAX_PACKETS = 500
+
 def _load_offset() -> int:
     try:
         if _OFFSET_FILE.exists():
@@ -71,8 +75,8 @@ _rate_limits: dict[str, list[float]] = {}  # ip → list of request timestamps
 _log_buffer: list = []  # rolling log buffer for web UI
 MAX_LOG = 200
 RATE_LIMIT_WINDOW = 10  # seconds
-RATE_SEND_MAX = 3       # max sends per window
-RATE_GET_MAX = 30       # max GETs per window
+RATE_SEND_MAX = 10      # max sends per window
+RATE_GET_MAX = 60       # max GETs per window
 
 WEB_PORT = int(os.environ.get("PORT", "8080"))
 
@@ -181,6 +185,21 @@ def _init_db():
     db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
     db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ch ON messages(ch)")
     db.execute("PRAGMA journal_mode=WAL")  # better concurrency
+    db.execute("CREATE TABLE IF NOT EXISTS packets ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               "ts TEXT NOT NULL,"
+               "sender TEXT NOT NULL,"
+               "sender_key TEXT,"
+               "text TEXT,"
+               "ch TEXT NOT NULL,"
+               "path TEXT,"
+               "path_hops INTEGER DEFAULT 0,"
+               "snr REAL,"
+               "rssi REAL,"
+               "observers INTEGER DEFAULT 0,"
+               "observer_list TEXT,"
+               "raw_payload TEXT)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_packets_ts ON packets(ts)")
     db.commit()
     db.close()
 
@@ -236,14 +255,69 @@ def _db_count(search: str = "", channel: str = "") -> int:
     except Exception:
         return 0
 
+def _db_insert_packet(sender: str, sender_key: str, text: str, ch: str,
+                      path: str, path_hops: int, snr, rssi, raw_payload: str):
+    """Insert a packet trace into the packets table."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        db.execute(
+            "INSERT INTO packets (ts, sender, sender_key, text, ch, path, path_hops, snr, rssi, raw_payload) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), sender, sender_key, text[:200] if text else "",
+             ch, path, path_hops, snr, rssi, raw_payload))
+        pid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # Prune old packets beyond _MAX_PACKETS
+        db.execute(f"DELETE FROM packets WHERE id NOT IN (SELECT id FROM packets ORDER BY id DESC LIMIT {_MAX_PACKETS})")
+        db.commit()
+        db.close()
+        return pid
+    except Exception as e:
+        print(f"[bridge] Packet DB insert error: {e}", file=sys.stderr)
+        return None
+
+def _db_update_packet_observers(text_prefix: str, count: int, obs_list: str):
+    """Update observers column for packets matching a text prefix."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        escaped = text_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        db.execute(
+            "UPDATE packets SET observers = ?, observer_list = ? WHERE text LIKE ? ESCAPE '\\'",
+            (count, obs_list, f"{escaped}%"))
+        db.commit()
+        db.close()
+    except Exception as e:
+        print(f"[bridge] Packet observer update error: {e}", file=sys.stderr)
+
+def _db_get_packets(limit: int = 100) -> list[dict]:
+    """Get recent packets with observer data."""
+    try:
+        db = sqlite3.connect(str(_DB_FILE))
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT id, ts, sender, sender_key, text, ch, path, path_hops, snr, rssi, observers, observer_list, raw_payload "
+            "FROM packets ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        db.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["raw_payload"] = json.loads(d["raw_payload"]) if d.get("raw_payload") else None
+            except (json.JSONDecodeError, TypeError):
+                d["raw_payload"] = d.get("raw_payload")  # keep as string if malformed
+            result.append(d)
+        return result
+    except Exception as e:
+        print(f"[bridge] Packet DB query error: {e}", file=sys.stderr)
+        return []
+
 def _push_msg(direction: str, channel: str, sender: str, text: str):
     """Push a structured message to the chat history with dedup."""
     # Dedup: skip "in" if same text+channel was just sent as "out"
     if direction == "in":
         for i in range(len(_msg_history) - 1, max(len(_msg_history) - 20, -1), -1):
             m = _msg_history[i]
-            if m["dir"] == "out" and m["ch"] == channel and m["text"] == text:
-                return  # echo of our own message, skip
+            if m["ch"] == channel and m["from"] == sender and m["text"] == text:
+                return  # duplicate (same sender+channel+text) — skip multi-repeater relay
     entry = {
         "ts": datetime.now().strftime("%H:%M:%S"),
         "dir": direction,
@@ -365,6 +439,20 @@ async def send_tg(text: str, chat_id: str = None) -> bool:
 
 # ── MeshCore handlers ────────────────────────────────────────
 
+def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_str: str, path_hops: int, snr, rssi):
+    """Record packet metadata to SQLite."""
+    try:
+        payload = json.dumps({"sender": sender, "ch": ch, "snr": snr, "rssi": rssi, "path": path_str})
+        pid = _db_insert_packet(sender, sender_key, text, ch, path_str, path_hops, snr, rssi, payload)
+        if pid:
+            _packet_observers[text[:60]] = set()  # init observer set for this message
+        # Cleanup old packet observer entries
+        if len(_packet_observers) > 200:
+            for k in list(_packet_observers.keys())[:100]:
+                del _packet_observers[k]
+    except Exception as e:
+        print(f"[bridge] Packet track error: {e}", file=sys.stderr)
+
 async def on_contact_message(mc, event):
     global _last_sender, _last_rx_ts
     _last_rx_ts = time.time()
@@ -387,6 +475,11 @@ async def on_contact_message(mc, event):
     msg = f"📡 <b>MeshCore</b> {t}\n👤 {esc(sender)}{s}\n\n{esc(text)}\n\n\u2014\n💬 Odpisz: /r {esc(sender)} <tekst>"
     _log(f"<- od {sender}: {text[:60]}")
     _push_msg("in", "DM", sender, text)
+    # Track packet
+    path_str = p.get("path", "")
+    path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
+    rssi = p.get("RSSI", None)
+    _track_packet(sender, pk, text, "DM", path_str, path_hops, snr, rssi)
     await send_tg(msg)
 
 
@@ -420,6 +513,13 @@ async def on_channel_message(mc, event):
     msg = f"📢 <b>Kanal {ch}</b> {t}\n👤 {esc(sender)}\n\n{esc(text)}"
     _log(f"<- kanal{ch} {sender}: {text[:60]}")
     _push_msg("in", f"CH{ch}", sender, text)
+    # Track packet
+    path_str = p.get("path", "")
+    path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
+    rssi = p.get("RSSI", None)
+    ch_snr = p.get("SNR", None)
+    ch_label = f"CH{ch}"
+    _track_packet(sender, pk, text, ch_label, path_str, path_hops, ch_snr, rssi)
     await send_tg(msg)
 
 
@@ -436,6 +536,12 @@ async def on_ack(mc, event):
                 _msg_acks[text] = set()
             _msg_acks[text].add(key)
             _log(f"ACK od {key}: {text[:40]}")
+            # Update packet observer set — O(1) dict lookup by consistent key
+            msg_key = text[:60]
+            if msg_key in _packet_observers:
+                _packet_observers[msg_key].add(key)
+                observers = _packet_observers[msg_key]
+                _db_update_packet_observers(msg_key, len(observers), ",".join(sorted(observers)))
     # Cleanup old entries
     if len(_msg_acks) > 100:
         for k in list(_msg_acks.keys())[:50]:
@@ -561,6 +667,7 @@ async def handle_tg_cmd(mc, text: str):
             else:
                 _log(f"-> kanal{ch}: {txt[:60]}")
                 _push_msg("out", f"CH{ch}", "TG", txt)
+                _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None)
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(txt)}")
         except Exception as e:
             await send_tg(f"Blad: {e}")
@@ -643,13 +750,17 @@ async def tg_poll_loop(mc):
 _session_token: str = ""
 
 LOGIN_FORM = r"""
-<div id="login-overlay" style="position:fixed;top:0;left:0;width:100%;height:100%;background:#0a0e1a;display:flex;align-items:center;justify-content:center;z-index:9999">
-  <div style="background:#121828;border:1px solid #2a3a4a;border-radius:12px;padding:30px;width:320px;text-align:center">
-    <h2 style="margin-bottom:16px;color:#66b8ff">🔐 MeshCore Bridge</h2>
-    <input id="login-user" type="text" placeholder="Uzytkownik" style="width:100%;padding:10px;margin-bottom:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:14px">
-    <input id="login-pass" type="password" placeholder="Haslo" style="width:100%;padding:10px;margin-bottom:16px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:14px" onkeydown="if(event.key==='Enter')doLogin()">
-    <button onclick="doLogin()" style="width:100%;padding:10px;background:#1e3a5f;border:none;border-radius:8px;color:#66b8ff;font-weight:600;cursor:pointer;font-size:14px">Zaloguj</button>
-    <div id="login-err" style="color:#ff6666;font-size:12px;margin-top:10px;display:none"></div>
+<div id="login-overlay" class="login-overlay">
+  <div class="login-card">
+    <div class="login-mark">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/><circle cx="12" cy="12" r="3"/></svg>
+    </div>
+    <h1>MeshCore Bridge</h1>
+    <p class="login-sub">Zaloguj się, aby zarządzać mostem</p>
+    <div class="field"><label>Użytkownik</label><input id="login-user" type="text" autocomplete="username"></div>
+    <div class="field"><label>Hasło</label><input id="login-pass" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="btn btn-primary btn-block" onclick="doLogin()">Zaloguj</button>
+    <div id="login-err" class="login-err"></div>
   </div>
 </div>
 <script>
@@ -675,241 +786,571 @@ load();loadLog();loadDeviceCards();setInterval(load,5000);setInterval(loadLog,20
 
 WEB_HTML = r"""<!DOCTYPE html>
 <html lang="pl">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MeshCore Bridge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
+:root{
+  --bg:#0a0e13;
+  --bg-1:#0f141b;
+  --bg-2:#151b23;
+  --bg-3:#1b222c;
+  --border:#232b36;
+  --border-soft:#1a212a;
+  --text:#e6ecf3;
+  --text-dim:#8993a3;
+  --text-faint:#576172;
+  --accent:#e2a34e;
+  --accent-2:#d4913a;
+  --accent-soft:rgba(226,163,78,.14);
+  --good:#4fd193;
+  --good-soft:rgba(79,209,147,.14);
+  --bad:#f16565;
+  --bad-soft:rgba(241,101,101,.14);
+  --warn:#eecb56;
+  --font-sans:'Inter',system-ui,-apple-system,sans-serif;
+  --font-mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',monospace;
+  --radius:10px;
+  --radius-sm:7px;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,sans-serif;background:#0a0e1a;color:#d0d8e8;padding:20px;max-width:1200px;margin:0 auto}
-h1{color:#66b8ff;font-size:22px;margin-bottom:16px}
-h2{color:#88c8ff;font-size:16px;margin:16px 0 8px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
-.card{background:#121828;border:1px solid #1e2a3a;border-radius:12px;padding:14px}
-.card .val{font-size:20px;font-weight:600;color:#66b8ff}
-.card .lbl{font-size:12px;color:#8899b0;margin-top:2px}
-pre.log{background:#080c14;border:1px solid #1a2434;border-radius:8px;padding:10px;font-size:12px;height:300px;overflow:auto;font-family:'Consolas','Courier New',monospace;color:#aabbcc;line-height:1.5}
-pre.log .ts{color:#556677}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{padding:6px 8px;text-align:left;border-bottom:1px solid #1a2434}
-th{color:#8899b0;font-weight:500}
-.status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.dot-green{background:#22c55e}
-.dot-red{background:#ef4444}
-.nav{display:flex;gap:8px;margin-bottom:20px}
-.nav a{padding:6px 14px;border-radius:8px;text-decoration:none;color:#8899b0;font-size:14px;border:1px solid transparent}
-.nav a.active,.nav a:hover{background:#1a2a3a;color:#66b8ff;border-color:#2a3a4a}
+html,body{height:100%}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);font-size:14px;-webkit-font-smoothing:antialiased}
+::selection{background:var(--accent-soft);color:var(--accent)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--text-faint)}
+a{color:inherit;text-decoration:none}
+button{font-family:inherit;cursor:pointer}
+input,select{font-family:inherit}
+hr{border:none;border-top:1px solid var(--border-soft)}
+
+.shell{display:flex;min-height:100vh}
+
+/* sidebar */
+.sidebar{width:212px;flex-shrink:0;background:var(--bg-1);border-right:1px solid var(--border-soft);display:flex;flex-direction:column;padding:18px 12px;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:9px;padding:6px 8px 20px;color:var(--accent)}
+.brand svg{flex-shrink:0}
+.brand span{font-family:var(--font-mono);font-weight:600;font-size:13px;letter-spacing:.09em;color:var(--text)}
+.nav{display:flex;flex-direction:column;gap:2px;flex:1}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:var(--radius-sm);color:var(--text-dim);font-size:13.5px;font-weight:500;border-left:2px solid transparent}
+.nav-item svg{flex-shrink:0;opacity:.85}
+.nav-item:hover{background:var(--bg-2);color:var(--text)}
+.nav-item.active{background:var(--accent-soft);color:var(--accent);border-left-color:var(--accent)}
+.sidebar-foot{display:flex;flex-direction:column;gap:10px;padding:10px 8px 4px;border-top:1px solid var(--border-soft);margin-top:8px}
+.conn-chip{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-dim)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--text-faint);flex-shrink:0}
+.dot.on{background:var(--good);box-shadow:0 0 0 3px var(--good-soft)}
+.dot.off{background:var(--bad);box-shadow:0 0 0 3px var(--bad-soft)}
+.clock{font-family:var(--font-mono);font-size:12px;color:var(--text-faint);letter-spacing:.03em}
+
+/* main */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:20px 28px;border-bottom:1px solid var(--border-soft);position:sticky;top:0;background:rgba(10,14,19,.85);backdrop-filter:blur(6px);z-index:5}
+.topbar h1{font-size:17px;font-weight:600;letter-spacing:-.01em}
+#app{padding:24px 28px 60px}
+.page{display:flex;flex-direction:column;gap:20px}
+
+/* panel */
+.panel{background:var(--bg-1);border:1px solid var(--border-soft);border-radius:var(--radius)}
+.panel-head{display:flex;align-items:center;justify-content:space-between;padding:13px 16px;border-bottom:1px solid var(--border-soft)}
+.panel-head h2{font-size:12.5px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--text-dim)}
+.panel-body{padding:14px 16px}
+.panel-actions{display:flex;gap:8px}
+
+/* stat / cfg grids */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.stat-card{background:var(--bg-1);border:1px solid var(--border-soft);border-left:2px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px}
+.stat-card.k-good{border-left-color:var(--good)}
+.stat-card.k-warn{border-left-color:var(--warn)}
+.stat-card.k-bad{border-left-color:var(--bad)}
+.stat-card.k-accent{border-left-color:var(--accent)}
+.stat-value{font-family:var(--font-mono);font-size:19px;font-weight:600}
+.stat-label{font-size:11.5px;color:var(--text-faint);margin-top:3px;text-transform:uppercase;letter-spacing:.05em}
+.cfg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--bg-2);color:var(--text);font-size:13px;font-weight:500;transition:border-color .15s,background .15s}
+.btn:hover{border-color:var(--text-faint);background:var(--bg-3)}
+.btn-primary{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+.btn-primary:hover{background:var(--accent);color:#1a1206}
+.btn-danger{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
+.btn-danger:hover{background:var(--bad);color:#2a0a0a}
+.btn-block{width:100%;justify-content:center}
+.btn-sm{padding:6px 10px;font-size:12px}
+
+/* inputs */
+.field{margin-bottom:12px}
+.field label{display:block;font-size:11.5px;color:var(--text-faint);margin-bottom:5px;text-transform:uppercase;letter-spacing:.05em}
+.hint{font-size:11px;color:var(--text-faint);margin-top:4px;font-weight:400}
+input[type=text],input[type=password],input[type=number],select,textarea{width:100%;padding:9px 11px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--text-faint) 50%),linear-gradient(135deg,var(--text-faint) 50%,transparent 50%);background-position:calc(100% - 16px) center,calc(100% - 11px) center;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.row-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+label.check{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-dim);margin-bottom:10px}
+label.check span.note{color:var(--text-faint);font-weight:400}
+
+/* table */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;padding:8px 10px;color:var(--text-faint);font-weight:500;text-transform:uppercase;font-size:10.5px;letter-spacing:.06em;border-bottom:1px solid var(--border-soft)}
+td{padding:8px 10px;border-bottom:1px solid var(--border-soft)}
+tr:last-child td{border-bottom:none}
+.sortable{cursor:pointer;user-select:none}
+.sortable:hover{color:var(--text)}
+.mono{font-family:var(--font-mono)}
+
+/* chips */
+.chip-row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.chip{padding:7px 13px;border-radius:99px;border:1px solid var(--border);background:var(--bg-2);color:var(--text-dim);font-size:12.5px;font-weight:600;font-family:var(--font-mono)}
+.chip.active{background:var(--accent);border-color:var(--accent);color:#1a1206}
+
+/* log */
+.log-box{background:var(--bg);border:1px solid var(--border-soft);border-radius:var(--radius-sm);padding:10px 12px;height:280px;overflow:auto;font-family:var(--font-mono);font-size:11.5px;line-height:1.7;color:var(--text-dim);white-space:pre-wrap;word-break:break-word}
+.log-box .t{color:var(--text-faint);margin-right:8px}
+
+/* map */
+#map{height:340px;border-radius:var(--radius-sm);border:1px solid var(--border-soft)}
+
+/* contacts */
+.contacts-scroll{max-height:320px;overflow:auto}
+.search-bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.search-bar input{flex:1;min-width:180px}
+
+/* drawer */
+.drawer{background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-top:14px}
+.drawer-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.drawer-head h3{font-size:14px;color:var(--accent)}
+.drawer-close{background:none;border:none;color:var(--text-faint);font-size:20px;line-height:1}
+.kv{width:100%;font-size:12.5px}
+.kv td{padding:6px 4px;border-bottom:1px solid var(--border-soft);vertical-align:top}
+.kv td:first-child{color:var(--text-faint);width:150px}
+pre.raw{background:var(--bg);border:1px solid var(--border-soft);border-radius:var(--radius-sm);padding:10px;font-size:11px;max-height:200px;overflow:auto;color:var(--text-dim);margin-top:8px;font-family:var(--font-mono);white-space:pre-wrap;word-break:break-word}
+
+/* chat */
+.chat-wrap{display:flex;flex-direction:column;height:calc(100vh - 170px)}
+.chat-msgs{flex:1;overflow-y:auto;background:var(--bg);border:1px solid var(--border-soft);border-radius:var(--radius);padding:14px;margin-bottom:12px;display:flex;flex-direction:column;gap:8px}
+.bubble{max-width:72%;padding:9px 12px;border-radius:10px;font-size:13px;line-height:1.5;border:1px solid var(--border-soft)}
+.bubble.out{align-self:flex-end;background:var(--accent-soft);border-color:transparent}
+.bubble.in{align-self:flex-start;background:var(--bg-2)}
+.bubble .meta{font-size:10.5px;color:var(--text-faint);margin-bottom:3px;font-family:var(--font-mono)}
+.bubble.out .meta{color:var(--accent-2)}
+.chat-input-row{display:flex;gap:8px}
+.empty{color:var(--text-faint);text-align:center;padding:40px 10px;font-size:13px}
+
+/* history */
+.hist-list{display:flex;flex-direction:column;gap:6px}
+.hist-row{padding:8px 10px;border:1px solid var(--border-soft);border-radius:var(--radius-sm);font-size:12.5px;background:var(--bg)}
+.hist-row .t{font-family:var(--font-mono);color:var(--text-faint);margin-right:8px;font-size:11px}
+.pager{display:flex;align-items:center;gap:10px;margin-top:12px;font-size:12.5px;color:var(--text-faint)}
+
+/* login */
+.login-overlay{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:999}
+.login-card{width:320px;background:var(--bg-1);border:1px solid var(--border-soft);border-radius:var(--radius);padding:28px}
+.login-mark{color:var(--accent);margin-bottom:14px}
+.login-card h1{font-size:16px;margin-bottom:4px}
+.login-sub{font-size:12.5px;color:var(--text-faint);margin-bottom:18px}
+.login-err{color:var(--bad);font-size:12px;margin-top:10px;display:none}
+
+/* toast */
+#toast-wrap{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:1000}
+.toast{background:var(--bg-2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--radius-sm);padding:10px 14px;font-size:12.5px;min-width:220px;box-shadow:0 6px 18px rgba(0,0,0,.35)}
+.toast.bad{border-left-color:var(--bad)}
+.toast.good{border-left-color:var(--good)}
+
+@media(max-width:860px){
+  .sidebar{position:fixed;left:0;bottom:0;top:auto;width:100%;height:auto;flex-direction:row;border-right:none;border-top:1px solid var(--border-soft);padding:8px 10px;z-index:50}
+  .brand,.sidebar-foot{display:none}
+  .nav{flex-direction:row;justify-content:space-around;flex:1}
+  .nav-item{flex-direction:column;gap:2px;font-size:10.5px;border-left:none;border-top:2px solid transparent}
+  .nav-item.active{border-top-color:var(--accent);border-left:none}
+  .main{padding-bottom:64px}
+  #app{padding:16px}
+  .topbar{padding:14px 16px}
+  .chat-wrap{height:calc(100vh - 220px)}
+}
 </style>
 </head>
 <body>
-<div class="nav">
-  <a href="/" class="active" data-page="dashboard">Dashboard</a>
-  <a href="/chat" data-page="chat">Czat</a>
-  <a href="/config" data-page="config">Konfiguracja</a>
-  <a href="/history" data-page="history">Historia</a>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/><circle cx="12" cy="12" r="3"/></svg>
+      <span>MESHBRIDGE</span>
+    </div>
+    <nav class="nav">
+      <a href="/" class="nav-item active" data-page="dashboard">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        Panel
+      </a>
+      <a href="/chat" class="nav-item" data-page="chat">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+        Czat
+      </a>
+      <a href="/config" class="nav-item" data-page="config">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+        Konfiguracja
+      </a>
+      <a href="/history" class="nav-item" data-page="history">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        Historia
+      </a>
+      <a href="/packets" class="nav-item" data-page="packets">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1"/><circle cx="8" cy="12" r="1"/><circle cx="8" cy="18" r="1"/></svg>
+        Pakiety
+      </a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="conn-chip"><span class="dot" id="conn-dot"></span><span id="conn-text">łączenie…</span></div>
+      <div class="clock" id="clock">--:--:--</div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h1 id="page-title">Panel</h1>
+    </header>
+
+    <div id="app">
+      <div id="page-dashboard" class="page">
+        <div class="stat-grid" id="stats"></div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Host</h2></div>
+          <div class="panel-body"><div class="stat-grid" id="sys-cards"></div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Urządzenie</h2>
+            <div class="panel-actions">
+              <button class="btn btn-sm" onclick="fetch('/api/device/advert',{method:'POST'}).then(r=>r.json()).then(d=>toast(d.ok?'Advert wysłany':'Błąd wysyłki advertu',d.ok?'good':'bad'))">Wyślij advert</button>
+              <button class="btn btn-sm" onclick="loadDeviceCards()">Odśwież</button>
+            </div>
+          </div>
+          <div class="panel-body"><div class="stat-grid" id="device-cards"></div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Mapa sieci</h2></div>
+          <div class="panel-body"><div id="map"></div></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Nody</h2></div>
+          <div class="panel-body"><table id="nodes"><tr><th>Node</th><th>Widziany</th><th>Odległość</th></tr></table></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Kontakty</h2></div>
+          <div class="panel-body">
+            <div class="contacts-scroll"><table id="contacts-table"></table></div>
+            <div id="contact-detail" class="drawer" style="display:none">
+              <div class="drawer-head">
+                <h3 id="cd-name"></h3>
+                <button class="drawer-close" onclick="closeDetail()">&times;</button>
+              </div>
+              <table class="kv">
+                <tr><td>Klucz publiczny</td><td id="cd-key" class="mono" style="font-size:11px;word-break:break-all"></td></tr>
+                <tr><td>Advert Type</td><td id="cd-type"></td></tr>
+                <tr><td>Flagi</td><td id="cd-flags"></td></tr>
+                <tr><td>Pozycja</td><td id="cd-pos"></td></tr>
+                <tr><td>Odległość</td><td id="cd-dist"></td></tr>
+                <tr><td>TX Power</td><td id="cd-txp"></td></tr>
+                <tr><td>Odebrany</td><td id="cd-last"></td></tr>
+                <tr><td>Ostatnia modyfikacja</td><td id="cd-mod"></td></tr>
+                <tr><td>Ścieżka routingu</td><td id="cd-path"></td></tr>
+              </table>
+              <div style="display:flex;gap:10px;margin-top:10px">
+                <button class="btn btn-sm" onclick="copyKey()">Kopiuj klucz</button>
+                <button class="btn btn-sm" onclick="toggleRaw()">Raw data</button>
+              </div>
+              <pre id="cd-raw" class="raw" style="display:none"></pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Log zdarzeń</h2></div>
+          <div class="panel-body"><div class="log-box" id="log"></div></div>
+        </div>
+      </div>
+
+      <div id="page-chat" class="page" style="display:none">
+        <div class="chat-wrap">
+          <div class="chip-row" id="chat-chips">
+            <button class="chip active" data-ch="0" onclick="setChan(0)">CH 0 · #public</button>
+            <button class="chip" data-ch="1" onclick="setChan(1)">CH 1</button>
+            <button class="chip" data-ch="2" onclick="setChan(2)">CH 2</button>
+            <button class="chip" data-ch="3" onclick="setChan(3)">CH 3</button>
+            <button class="chip" data-ch="4" onclick="setChan(4)">CH 4</button>
+            <button class="chip" data-ch="5" onclick="setChan(5)">CH 5</button>
+            <button class="chip" data-ch="6" onclick="setChan(6)">CH 6</button>
+            <button class="chip" data-ch="7" onclick="setChan(7)">CH 7</button>
+          </div>
+          <select id="chat-chan" style="display:none">
+            <option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option>
+            <option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option>
+          </select>
+          <div class="chat-msgs" id="chat-msgs"><div class="empty">Wybierz kanał i czekaj na wiadomości…</div></div>
+          <div class="chat-input-row">
+            <input id="chat-input" type="text" placeholder="Napisz wiadomość…" onkeydown="if(event.key==='Enter')chatSend()">
+            <button class="btn btn-primary" onclick="chatSend()">Wyślij</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="page-history" class="page" style="display:none">
+        <div class="panel">
+          <div class="panel-body">
+            <div class="search-bar">
+              <input id="hist-search" type="text" placeholder="Szukaj w wiadomościach…" onkeydown="if(event.key==='Enter')histLoad(0)">
+              <select id="hist-chan" style="max-width:170px" onchange="histLoad(0)">
+                <option value="">Wszystkie kanały</option>
+                <option value="CH0">Kanał 0</option>
+                <option value="CH1">Kanał 1</option>
+                <option value="DM">DM</option>
+              </select>
+              <button class="btn btn-primary" onclick="histLoad(0)">Szukaj</button>
+            </div>
+            <div class="hist-list" id="hist-results"></div>
+            <div class="pager" id="hist-pager"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="page-packets" class="page" style="display:none">
+        <div class="panel">
+          <div class="panel-head"><h2>Ostatnie pakiety</h2>
+            <div class="panel-actions">
+              <button class="btn btn-sm" onclick="loadPackets()">Odśwież</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="hist-list" id="packets-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="page-config" class="page" style="display:none">
+        <div class="cfg-grid">
+          <div class="panel">
+            <div class="panel-head"><h2>Nazwa</h2></div>
+            <div class="panel-body">
+              <div class="field"><input id="cfg-name" placeholder="WWR01M"><div class="hint">Nazwa urządzenia widoczna w sieci MeshCore (max 32 znaki)</div></div>
+              <button class="btn btn-primary" onclick="setCfg({name: document.getElementById('cfg-name').value})">Zapisz</button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>TX Power</h2></div>
+            <div class="panel-body">
+              <div class="field"><input id="cfg-txp" type="number" value="20" min="2" max="22"><div class="hint">Moc nadajnika 2–22 dBm. Wyższa = dalszy zasięg, większe zużycie baterii</div></div>
+              <button class="btn btn-primary" onclick="setCfg({tx_power: +document.getElementById('cfg-txp').value})">Ustaw</button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Współrzędne</h2></div>
+            <div class="panel-body">
+              <div class="row-2">
+                <div class="field"><input id="cfg-lat" type="number" step="0.000001" placeholder="50.1197"></div>
+                <div class="field"><input id="cfg-lon" type="number" step="0.000001" placeholder="20.2789"></div>
+              </div>
+              <div class="hint" style="margin-bottom:10px">Szerokość i długość geograficzna (GPS). Do obliczania odległości i mapy</div>
+              <button class="btn btn-primary" onclick="setCfg({coords:[+document.getElementById('cfg-lat').value,+document.getElementById('cfg-lon').value]})">Zapisz</button>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>PIN urządzenia</h2></div>
+            <div class="panel-body">
+              <div class="field"><input id="cfg-pin" type="password" placeholder="••••••"><div class="hint">Kod PIN do parowania BLE. Chroni przed nieautoryzowanym dostępem przez Bluetooth</div></div>
+              <button class="btn btn-primary" onclick="setCfg({devicepin: document.getElementById('cfg-pin').value})">Ustaw PIN</button>
+            </div>
+          </div>
+
+          <div class="panel" style="grid-column:1/-1">
+            <div class="panel-head"><h2>Radio</h2></div>
+            <div class="panel-body">
+              <div class="hint" style="margin-bottom:10px">Parametry radia LoRa. Wszystkie urządzenia w sieci muszą mieć te same ustawienia.</div>
+              <div class="cfg-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:12px">
+                <div class="field"><label>Częst. (MHz)</label><input id="cfg-freq" type="number" step="0.001" value="869.618"></div>
+                <div class="field"><label>BW (kHz)</label><input id="cfg-bw" type="number" step="0.1" value="62.5"></div>
+                <div class="field"><label>SF</label><input id="cfg-sf" type="number" value="8" min="7" max="12"></div>
+                <div class="field"><label>CR (5–8)</label><input id="cfg-cr" type="number" value="8" min="5" max="8"></div>
+                <div class="field"><label>RX Dly</label><input id="cfg-rxdly" type="number" value="0"></div>
+                <div class="field"><label>AF</label><input id="cfg-af" type="number" value="0"></div>
+              </div>
+              <div style="display:flex;gap:8px">
+                <button class="btn btn-primary" onclick="setCfg({freq:+document.getElementById('cfg-freq').value,bw:+document.getElementById('cfg-bw').value,sf:+document.getElementById('cfg-sf').value,cr:+document.getElementById('cfg-cr').value})">Zapisz radio</button>
+                <button class="btn" onclick="setCfg({rx_dly:+document.getElementById('cfg-rxdly').value,af:+document.getElementById('cfg-af').value})">Zapisz tuning</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Telemetria</h2></div>
+            <div class="panel-body">
+              <div class="hint" style="margin-bottom:10px">Częstotliwość wysyłania danych. 0 = OFF, 3 = najczęściej</div>
+              <div class="field"><label>Mode Base</label><select id="cfg-tmb"><option value="0">0 – OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></div>
+              <div class="field"><label>Mode Loc</label><select id="cfg-tml"><option value="0">0 – OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></div>
+              <div class="field"><label>Mode Env</label><select id="cfg-tme"><option value="0">0 – OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select></div>
+              <button class="btn btn-primary" onclick="setCfg({telemetry_mode_base:+document.getElementById('cfg-tmb').value,telemetry_mode_loc:+document.getElementById('cfg-tml').value,telemetry_mode_env:+document.getElementById('cfg-tme').value})">Zapisz telemetrię</button>
+              <hr style="margin:14px 0">
+              <label class="check"><input id="cfg-mac" type="checkbox" onchange="setCfg({manual_add_contacts:this.checked})"> Manual add contacts</label>
+              <div class="field"><label>Advert Loc Policy</label><select id="cfg-alp" onchange="setCfg({advert_loc_policy:+this.value})"><option value="0">0</option><option value="1">1</option><option value="2">2</option></select></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Zaawansowane</h2></div>
+            <div class="panel-body">
+              <div class="hint" style="margin-bottom:10px">Opcje dla zaawansowanych. Zmieniaj tylko jeśli wiesz co robisz.</div>
+              <div class="field"><label>Path Hash Mode</label>
+                <select id="cfg-phm" onchange="setCfg({path_hash_mode:+this.value})">
+                  <option value="0">0 — 1 bajt (254 ID, 64 hopy, legacy)</option>
+                  <option value="1">1 — 2 bajty (65k ID, 32 hopy, zalecany)</option>
+                  <option value="2">2 — 3 bajty (16M ID, 21 hopów, gęste sieci)</option>
+                </select>
+                <div class="hint">Zmiana wymaga wysłania Advert. <a href="https://nodakmesh.org/blog/meshcore-path-hash-explained" target="_blank" style="color:var(--accent)">Więcej info</a></div>
+              </div>
+              <label class="check"><input id="cfg-macks" type="checkbox"> Multi ACKs <span class="note">(wysyła 2 potwierdzenia zamiast 1)</span></label>
+              <button class="btn btn-sm" onclick="setCfg({multi_acks:document.getElementById('cfg-macks').checked?1:0})">Ustaw</button>
+              <div class="field" style="margin-top:12px"><label>Flood Scope</label><input id="cfg-fs" type="text" placeholder="#public"></div>
+              <button class="btn btn-sm" onclick="setCfg({flood_scope:document.getElementById('cfg-fs').value})">Ustaw</button>
+              <div class="field" style="margin-top:12px"><label>Custom Var (JSON)</label><input id="cfg-cv" type="text" placeholder='{"key":"x","value":"y"}'></div>
+              <button class="btn btn-sm" onclick="try{setCfg({custom_var:JSON.parse(document.getElementById('cfg-cv').value)})}catch(e){toast('Nieprawidlowy JSON','bad')}">Ustaw</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head"><h2>Akcje</h2></div>
+            <div class="panel-body">
+              <div class="hint" style="margin-bottom:10px">Operacje na urządzeniu</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="btn" onclick="fetch('/api/device/advert',{method:'POST'}).then(r=>r.json()).then(d=>toast(d.ok?'Advert wysłany':'Błąd',d.ok?'good':'bad'))">Wyślij Advert</button>
+                <button class="btn btn-danger" onclick="if(confirm('Restartować Helteca?'))fetch('/api/device/reboot',{method:'POST'}).then(r=>r.json()).then(d=>toast(d.ok?'Restart…':'Błąd',d.ok?'good':'bad'))">Restart</button>
+                <button class="btn" onclick="loadDeviceInfo()">Odśwież</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>Info z urządzenia</h2></div>
+          <div class="panel-body"><div class="log-box" id="device-info" style="height:200px">Ładowanie…</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Statystyki</h2></div>
+          <div class="panel-body"><div class="log-box" id="stats-display" style="height:200px">Ładowanie…</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Kanały</h2></div>
+          <div class="panel-body"><div class="log-box" id="channels-display" style="height:200px">Ładowanie…</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
-<div id="app">
-  <div id="page-dashboard">
-    <h1>🔌 MeshCore Bridge</h1>
-    <div class="grid" id="stats"></div>
-    <h2>💻 Host</h2>
-    <div class="grid" id="sys-cards"></div>
-    <h2>📟 Urzadzenie</h2>
-    <div class="grid" id="device-cards"></div>
-    <div id="map" style="height:350px;border-radius:8px;border:1px solid #1a2434;margin-bottom:12px;background:#0a0e1a"></div>
-    <h2>📡 Siec</h2>
-    <table id="nodes"><tr><th>Node</th><th>Status</th></tr></table>
-    <h2>👥 Kontakty</h2>
-    <div id="contacts-wrap" style="max-height:300px;overflow-y:auto;background:#080c14;border:1px solid #1a2434;border-radius:8px;padding:8px;font-size:13px">
-    <table id="contacts-table" style="width:100%"><tr><th onclick="sortContacts('name')" style="cursor:pointer">Nazwa ▾</th><th onclick="sortContacts('dist_km')" style="cursor:pointer">Odleglosc ▾</th><th onclick="sortContacts('last_seen')" style="cursor:pointer">Widziany ▾</th><th></th></tr></table></div>
-    <div id="contact-detail" style="display:none;margin-top:8px;background:#121828;border:1px solid #2a3a4a;border-radius:12px;padding:14px">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <h3 id="cd-name" style="margin:0;color:#66b8ff;font-size:16px"></h3>
-        <button onclick="closeDetail()" style="background:none;border:none;color:#8899b0;font-size:20px;cursor:pointer">&times;</button>
-      </div>
-      <table style="width:100%;margin-top:8px;font-size:13px">
-        <tr><td style="color:#8899b0;width:120px">Klucz publiczny</td><td id="cd-key" style="font-family:monospace;font-size:11px;word-break:break-all"></td><td style="width:30px"><button onclick="copyKey()" style="background:none;border:none;color:#66b8ff;cursor:pointer;font-size:13px" title="Kopiuj">📋</button></td></tr>
-        <tr><td style="color:#8899b0">Advert Type</td><td id="cd-type" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">Flagi</td><td id="cd-flags" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">Pozycja</td><td id="cd-pos" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">Odleglosc</td><td id="cd-dist" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">TX Power</td><td id="cd-txp" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">Odebrany</td><td id="cd-last" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">Ostatnia modyfikacja</td><td id="cd-mod" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0">Sciezka routingu</td><td id="cd-path" colspan="2"></td></tr>
-        <tr><td style="color:#8899b0"><button onclick="toggleRaw()" style="background:none;border:none;color:#66b8ff;cursor:pointer;font-size:12px;padding:0">📄 Raw data</button></td><td colspan="2"></td></tr>
-      </table>
-      <pre id="cd-raw" style="display:none;margin-top:8px;background:#080c14;border:1px solid #1a2434;border-radius:8px;padding:10px;font-size:11px;max-height:200px;overflow:auto;color:#8899b0"></pre>
-    </div>
-    <h2>📜 Ostatnie wiadomosci</h2>
-    <pre class="log" id="log"></pre>
-  </div>
-  <div id="page-chat" style="display:none">
-    <div style="display:flex;gap:12px;height:calc(100vh - 80px)">
-      <div style="flex:1;display:flex;flex-direction:column">
-        <h1 style="margin-bottom:12px">💬 Czat MeshCore</h1>
-        <select id="chat-chan" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin-bottom:8px">
-          <option value="0">Kanal 0 (#public)</option>
-          <option value="1">Kanal 1</option>
-          <option value="2">Kanal 2</option>
-          <option value="3">Kanal 3</option>
-          <option value="4">Kanal 4</option>
-          <option value="5">Kanal 5</option>
-          <option value="6">Kanal 6</option>
-          <option value="7">Kanal 7</option>
-        </select>
-        <div id="chat-msgs" style="flex:1;overflow-y:auto;background:#080c14;border:1px solid #1a2434;border-radius:8px;padding:10px;margin-bottom:8px;min-height:300px;font-size:13px">
-          <div style="color:#8899b0;text-align:center;padding:20px">Wybierz kanał i czekaj na wiadomosci...</div>
-        </div>
-        <div style="display:flex;gap:8px">
-          <input id="chat-input" type="text" placeholder="Napisz wiadomosc..." style="flex:1;padding:10px 14px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:14px" onkeydown="if(event.key==='Enter')chatSend()">
-          <button onclick="chatSend()" style="padding:10px 20px;background:#1e3a5f;border:none;border-radius:8px;color:#66b8ff;font-weight:600;cursor:pointer;font-size:14px">Wyślij</button>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div id="page-history" style="display:none">
-    <h1>📜 Historia wiadomosci</h1>
-    <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
-      <input id="hist-search" type="text" placeholder="Szukaj..." style="flex:1;min-width:200px;padding:8px 12px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:13px" onkeydown="if(event.key==='Enter')histLoad(0)">
-      <select id="hist-chan" style="padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;font-size:13px" onchange="histLoad(0)">
-        <option value="">Wszystkie kanaly</option>
-        <option value="CH0">Kanal 0</option>
-        <option value="CH1">Kanal 1</option>
-        <option value="DM">DM</option>
-      </select>
-      <button onclick="histLoad(0)" style="padding:8px 16px;background:#1e3a5f;border:none;border-radius:8px;color:#66b8ff;font-weight:600;cursor:pointer">Szukaj</button>
-    </div>
-    <div id="hist-results" style="background:#080c14;border:1px solid #1a2434;border-radius:8px;padding:8px;font-size:13px;max-height:70vh;overflow:auto"></div>
-    <div id="hist-pager" style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:13px;color:#8899b0"></div>
-  </div>
-  <div id="page-config" style="display:none">
-    <h1>⚙️ Konfiguracja urzadzenia</h1>
-    <div class="grid">
-      <div class="card">
-        <h3>Nazwa</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:4px">Nazwa urzadzenia widoczna w sieci MeshCore (max 32 znaki)</div>
-        <input id="cfg-name" placeholder="WWR01M" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <button onclick="setCfg({name: document.getElementById('cfg-name').value})">Zapisz</button>
-      </div>
-      <div class="card">
-        <h3>TX Power (dBm)</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:4px">Moc nadajnika 2-22 dBm. Wyzsza = dalszy zasieg, wieksze zuzycie baterii</div>
-        <input id="cfg-txp" type="number" value="20" min="2" max="22" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <button onclick="setCfg({tx_power: +document.getElementById('cfg-txp').value})">Ustaw</button>
-      </div>
-      <div class="card">
-        <h3>Wspolrzedne</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:4px">Szerokosc i dlugosc geograficzna (GPS). Do obliczania odleglosci i mapy</div>
-        <input id="cfg-lat" type="number" step="0.000001" placeholder="50.1197" style="width:48%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <input id="cfg-lon" type="number" step="0.000001" placeholder="20.2789" style="width:48%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <button onclick="setCfg({coords:[+document.getElementById('cfg-lat').value,+document.getElementById('cfg-lon').value]})">Zapisz</button>
-      </div>
-      <div class="card">
-        <h3>PIN urzadzenia</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:4px">Kod PIN do parowania BLE. Chroni przed nieautoryzowanym dostepem przez Bluetooth</div>
-        <input id="cfg-pin" type="password" placeholder="******" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:8px 0">
-        <button onclick="setCfg({devicepin: document.getElementById('cfg-pin').value})">Ustaw PIN</button>
-      </div>
-      <div class="card" style="grid-column:1/-1">
-        <h3>Radio</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:8px">Parametry radia LoRa. Wszystkie urzadzenia w sieci musza miec te same ustawienia!</div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px">
-          <div><label style="font-size:12px;color:#8899b0">Czest. (MHz)</label><input id="cfg-freq" type="number" step="0.001" value="869.618" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
-          <div><label style="font-size:12px;color:#8899b0">BW (kHz)</label><input id="cfg-bw" type="number" step="0.1" value="62.5" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
-          <div><label style="font-size:12px;color:#8899b0">SF</label><input id="cfg-sf" type="number" value="8" min="7" max="12" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
-          <div><label style="font-size:12px;color:#8899b0">CR (5-8)</label><input id="cfg-cr" type="number" value="8" min="5" max="8" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
-          <div><label style="font-size:12px;color:#8899b0">RX Dly</label><input id="cfg-rxdly" type="number" value="0" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
-          <div><label style="font-size:12px;color:#8899b0">AF</label><input id="cfg-af" type="number" value="0" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8"></div>
-        </div>
-        <button onclick="setCfg({freq:+document.getElementById('cfg-freq').value,bw:+document.getElementById('cfg-bw').value,sf:+document.getElementById('cfg-sf').value,cr:+document.getElementById('cfg-cr').value})" style="margin-top:8px">Zapisz radio</button>
-        <button onclick="setCfg({rx_dly:+document.getElementById('cfg-rxdly').value,af:+document.getElementById('cfg-af').value})" style="margin-top:8px">Zapisz tuning</button>
-      </div>
-      <div class="card">
-        <h3>Telemetria</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:8px">Czestotliwosc wysylania danych. 0=OFF, 3=najczesciej</div>
-        <label style="font-size:12px;color:#8899b0">Mode Base</label>
-        <select id="cfg-tmb" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0"><option value="0">0 - OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select>
-        <label style="font-size:12px;color:#8899b0">Mode Loc</label>
-        <select id="cfg-tml" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0"><option value="0">0 - OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select>
-        <label style="font-size:12px;color:#8899b0">Mode Env</label>
-        <select id="cfg-tme" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0"><option value="0">0 - OFF</option><option value="1">1</option><option value="2">2</option><option value="3">3</option></select>
-        <button onclick="setCfg({telemetry_mode_base:+document.getElementById('cfg-tmb').value,telemetry_mode_loc:+document.getElementById('cfg-tml').value,telemetry_mode_env:+document.getElementById('cfg-tme').value})" style="margin-top:4px">Zapisz telemetrie</button>
-        <hr style="border-color:#1a2434;margin:12px 0">
-        <label><input id="cfg-mac" type="checkbox" onchange="setCfg({manual_add_contacts:this.checked})"> Manual add contacts</label>
-        <label style="font-size:12px;color:#8899b0;display:block;margin-top:8px">Advert Loc Policy</label>
-        <select id="cfg-alp" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0" onchange="setCfg({advert_loc_policy:+this.value})"><option value="0">0</option><option value="1">1</option><option value="2">2</option></select>
-      </div>
-      <div class="card">
-        <h3>Zaawansowane</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:8px">Opcje dla zaawansowanych. Zmieniaj tylko jesli wiesz co robisz.</div>
-        <label style="font-size:12px;color:#8899b0">Multi ACKs <span style="color:#556;font-weight:normal">(wysyla 2 potwierdzenia zamiast 1 — zwieksza szanse dotarcia ACK)</span></label>
-        <input id="cfg-macks" type="checkbox" value="1" style="margin:4px 0;accent-color:#66b8ff">
-        <button onclick="setCfg({multi_acks:document.getElementById('cfg-macks').checked?1:0})">Ustaw</button>
-        <label style="font-size:12px;color:#8899b0;display:block;margin-top:8px">Flood Scope</label>
-        <input id="cfg-fs" type="text" placeholder="#public" style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <button onclick="setCfg({flood_scope:document.getElementById('cfg-fs').value})">Ustaw</button>
-        <label style="font-size:12px;color:#8899b0;display:block;margin-top:8px">Custom Var (JSON {"key":"...","value":"..."})</label>
-        <input id="cfg-cv" type="text" placeholder='{"key":"x","value":"y"}' style="width:100%;padding:8px;border-radius:8px;border:1px solid #2a3a4a;background:#0a0e1a;color:#d0d8e8;margin:4px 0">
-        <button onclick="try{setCfg({custom_var:JSON.parse(document.getElementById('cfg-cv').value)})}catch(e){alert('Invalid JSON')}">Ustaw</button>
-      </div>
-      <div class="card">
-        <h3>Akcje</h3>
-        <div style="font-size:11px;color:#556677;margin-bottom:8px">Operacje na urzadzeniu</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <button onclick="fetch('/api/device/advert',{method:'POST'}).then(r=>r.json()).then(d=>alert(d.ok?'Advert wyslany':'Blad'))">Wyslij Advert</button>
-          <button onclick="if(confirm('Restartowac Helteca?'))fetch('/api/device/reboot',{method:'POST'}).then(r=>r.json()).then(d=>alert(d.ok?'Restart...':'Blad'))" style="background:#ef4444">Restart</button>
-          <button onclick="loadDeviceInfo()">Odswiez</button>
-        </div>
-      </div>
-    </div>
-    <h2>📋 Info z urzadzenia</h2>
-    <pre class="log" id="device-info" style="height:200px">Ladowanie...</pre>
-    <h2>📊 Statystyki</h2>
-    <div id="stats-container"><pre class="log" id="stats-display" style="height:200px">Ladowanie...</pre></div>
-    <h2>📡 Kanaty</h2>
-    <div id="channels-container"><pre class="log" id="channels-display" style="height:200px">Ladowanie...</pre></div>
-  </div>
-</div>
+<div id="toast-wrap"></div>
+
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
+function esc(s){return String(s).replace(/[&<>"']/g,function(m){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
+
+function toast(msg,kind){
+  const t=document.createElement('div');
+  t.className='toast'+(kind?' '+kind:'');
+  t.textContent=msg;
+  document.getElementById('toast-wrap').appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300)},3500);
+}
+
+function tickClock(){document.getElementById('clock').textContent=new Date().toLocaleTimeString('pl-PL');}
+setInterval(tickClock,1000);tickClock();
+
 let _map=null,_markers=[];
 function initMap(lat,lon){if(!_map){_map=L.map('map').setView([lat,lon],9);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:18,attribution:'&copy; OpenStreetMap'}).addTo(_map);}
 updateMarkers(lat,lon);}
 function updateMarkers(myLat,myLon){_markers.forEach(m=>_map.removeLayer(m));_markers=[];
-if(myLat!=null){_markers.push(L.marker([myLat,myLon],{icon:L.divIcon({html:'<div style="background:#66b8ff;width:12px;height:12px;border-radius:50%;border:2px solid #fff"></div>',iconSize:[12,12],className:''})}).bindPopup('<b>WWR01M</b> (ja)').addTo(_map));}
-fetch('/api/device/contacts').then(r=>r.json()).then(d=>{if(d.contacts)d.contacts.forEach(c=>{if(c.lat!=null&&c.lon!=null){const m=L.marker([c.lat,c.lon],{icon:L.divIcon({html:'<div style="background:#88cc66;width:10px;height:10px;border-radius:50%;border:1px solid #fff"></div>',iconSize:[10,10],className:''})});m.bindPopup(`<b>${esc(c.name)}</b><br>${c.dist_km?c.dist_km+' km':'?'}<br>${c.last_seen||''}`);m.addTo(_map);_markers.push(m);}})});
-fetch('/api/status').then(r=>r.json()).then(d=>{if(d.node_data)Object.entries(d.node_data).forEach(([k,v])=>{if(v.lat!=null&&v.lon!=null){const m=L.marker([v.lat,v.lon],{icon:L.divIcon({html:'<div style="background:#ffaa44;width:8px;height:8px;border-radius:50%"></div>',iconSize:[8,8],className:''})});m.bindPopup(`<b>${esc(k.slice(0,8))}</b><br>${v.dist?v.dist+' km':'?'}<br>${v.ts||''}`);m.addTo(_map);_markers.push(m);}})})}
-function esc(s){return String(s).replace(/[&<>"']/g,function(m){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
-async function load(){const r=await fetch('/api/status');if(r.status===401){showLoginAgain();return};if(!r.ok)return;const d=await r.json();
-document.getElementById('stats').innerHTML=
-  `<div class="card"><div class="val"><span class="status-dot ${d.connected?'dot-green':'dot-red'}"></span>${d.connected?'Polaczony':'Rozlaczony'}</div><div class="lbl">Status</div></div>`+
-  `<div class="card"><div class="val">${esc(d.device_contacts||0)}</div><div class="lbl">Kontakty (urządzenie)</div></div>`+
-  `<div class="card"><div class="val">${esc(d.contacts)}</div><div class="lbl">Kontakty (cache DM)</div></div>`+
-  `<div class="card"><div class="val">${esc(d.nodes)}</div><div class="lbl">Widziane nody</div></div>`;
-const n=document.getElementById('nodes');
-n.innerHTML='<tr><th>Node</th><th>Widziany</th><th>Odleglosc</th></tr>';
-d.node_list.forEach(p=>{const nd=d.node_data[p]||{};const dist=nd.dist?nd.dist+' km':'—';n.innerHTML+=`<tr><td>${esc(p.slice(0,8))}</td><td>${esc(nd.ts||'-')}</td><td>${dist}</td></tr>`})}
-async function loadLog(){const r=await fetch('/api/log');if(r.status===401){showLoginAgain();return};if(!r.ok)return;const d=await r.json();
-document.getElementById('log').textContent=d.log.join('\n');}
-async function loadContacts(){const r=await fetch('/api/device/contacts');if(r.status===401){showLoginAgain();return};const d=await r.json();
-if(d.contacts){window._cd=d.contacts.slice(0,200);renderContactsTable();
-document.querySelector('#contacts-wrap').scrollTop=0;}}
-let _sortCol='name',_sortDir=1;
+if(myLat!=null){_markers.push(L.marker([myLat,myLon],{icon:L.divIcon({html:'<div style="background:#e2a34e;width:12px;height:12px;border-radius:50%;border:2px solid #0a0e13"></div>',iconSize:[12,12],className:''})}).bindPopup('<b>WWR01M</b> (ja)').addTo(_map));}
+fetch('/api/device/contacts').then(r=>r.json()).then(d=>{if(d.contacts)d.contacts.forEach(c=>{if(c.lat!=null&&c.lon!=null){const m=L.marker([c.lat,c.lon],{icon:L.divIcon({html:'<div style="background:#4fd193;width:10px;height:10px;border-radius:50%;border:1px solid #0a0e13"></div>',iconSize:[10,10],className:''})});m.bindPopup(`<b>${esc(c.name)}</b><br>${c.dist_km?c.dist_km+' km':'?'}<br>${c.last_seen||''}`);m.addTo(_map);_markers.push(m);}})});
+fetch('/api/status').then(r=>r.json()).then(d=>{if(d.node_data)Object.entries(d.node_data).forEach(([k,v])=>{if(v.lat!=null&&v.lon!=null){const m=L.marker([v.lat,v.lon],{icon:L.divIcon({html:'<div style="background:#eecb56;width:8px;height:8px;border-radius:50%"></div>',iconSize:[8,8],className:''})});m.bindPopup(`<b>${esc(k.slice(0,8))}</b><br>${v.dist?v.dist+' km':'?'}<br>${v.ts||''}`);m.addTo(_map);_markers.push(m);}})})}
+
+async function load(){
+  const r=await fetch('/api/status');
+  if(r.status===401){showLoginAgain();return}
+  if(!r.ok)return;
+  const d=await r.json();
+  const dot=document.getElementById('conn-dot'),txt=document.getElementById('conn-text');
+  dot.className='dot '+(d.connected?'on':'off');
+  txt.textContent=d.connected?'Połączony':'Rozłączony';
+  document.getElementById('stats').innerHTML=
+    `<div class="stat-card ${d.connected?'k-good':'k-bad'}"><div class="stat-value">${d.connected?'Online':'Offline'}</div><div class="stat-label">Status łącza</div></div>`+
+    `<div class="stat-card k-accent"><div class="stat-value">${esc(d.device_contacts||0)}</div><div class="stat-label">Kontakty (urządzenie)</div></div>`+
+    `<div class="stat-card"><div class="stat-value">${esc(d.contacts)}</div><div class="stat-label">Kontakty (cache DM)</div></div>`+
+    `<div class="stat-card"><div class="stat-value">${esc(d.nodes)}</div><div class="stat-label">Widziane nody</div></div>`;
+  const n=document.getElementById('nodes');
+  n.innerHTML='<tr><th>Node</th><th>Widziany</th><th>Odległość</th></tr>';
+  d.node_list.forEach(p=>{const nd=d.node_data[p]||{};const dist=nd.dist?nd.dist+' km':'—';
+    n.innerHTML+=`<tr><td class="mono">${esc(p.slice(0,8))}</td><td>${esc(nd.ts||'-')}</td><td>${dist}</td></tr>`});
+}
+
+async function loadLog(){
+  const r=await fetch('/api/log');
+  if(r.status===401){showLoginAgain();return}
+  if(!r.ok)return;
+  const d=await r.json();
+  const box=document.getElementById('log');
+  box.innerHTML=d.log.map(l=>{
+    const t=l.slice(0,8),rest=esc(l.slice(8));
+    let color='';
+    if(/blad|error|warning/i.test(rest))color='color:var(--bad)';
+    else if(rest.indexOf('->')!==-1)color='color:var(--accent)';
+    else if(rest.indexOf('<-')!==-1)color='color:var(--good)';
+    return `<div style="${color}"><span class="t">${esc(t)}</span>${rest}</div>`;
+  }).join('');
+  box.scrollTop=box.scrollHeight;
+}
+
+async function loadContacts(){
+  const r=await fetch('/api/device/contacts');
+  if(r.status===401){showLoginAgain();return}
+  const d=await r.json();
+  if(d.contacts){window._cd=d.contacts.slice(0,200);sortContacts('last_advert');renderContactsTable();}
+}
+let _sortCol='last_advert',_sortDir=-1;
 function sortContacts(col){if(_sortCol===col)_sortDir*=-1;else{_sortCol=col;_sortDir=1;}
 window._cd.sort((a,b)=>{
   let va=a[col],vb=b[col];
   if(col==='dist_km'){va=va||9999;vb=vb||9999;}
   if(col==='last_seen'){va=va||'';vb=vb||'';}
+  if(col==='last_advert'){va=va||0;vb=vb||0;}
   if(va<vb)return -1*_sortDir;if(va>vb)return 1*_sortDir;return 0;});
 renderContactsTable();}
+function _relTime(ts){
+  if(!ts)return '—';
+  const now=Date.now()/1000;
+  const d=now-ts;
+  if(d<60)return 'przed chwilą';
+  if(d<3600)return Math.round(d/60)+' min temu';
+  if(d<86400)return Math.round(d/3600)+'h temu';
+  if(d<604800)return Math.round(d/86400)+' dni temu';
+  return Math.round(d/604800)+' tyg temu';
+}
 function renderContactsTable(){
 const t=document.getElementById('contacts-table');
-t.innerHTML='<tr><th onclick="sortContacts(\'name\')" style="cursor:pointer">Nazwa '+(_sortCol=='name'?'▴':'▾')+'</th><th onclick="sortContacts(\'dist_km\')" style="cursor:pointer">Odleglosc '+(_sortCol=='dist_km'?'▴':'▾')+'</th><th onclick="sortContacts(\'last_seen\')" style="cursor:pointer">Widziany '+(_sortCol=='last_seen'?'▴':'▾')+'</th><th></th></tr>';
-window._cd.forEach((c,i)=>{const dst=c.dist_km?c.dist_km+' km':'-';const seen=c.last_seen||'-';
-t.innerHTML+='<tr><td>'+esc(c.name)+'</td><td>'+dst+'</td><td style="color:'+(c.last_seen&&c.last_seen.includes('⚠')?'#ff9944':'#8899b0')+'">'+seen+'</td><td style="text-align:right"><button onclick="showContact(\''+c.key+'\')" style="background:none;border:none;color:#8899b0;cursor:pointer;font-size:16px;padding:2px 6px">...</button></td></tr>';});}
-// Device type mapping from meshcore v2.3.7 (meshcore_parser.py:13)
-// CONTACT_TYPENAMES = ["NONE","CLI","REP","ROOM","SENS"]
-// Test: python -c "from meshcore.meshcore_parser import CONTACT_TYPENAMES; print(CONTACT_TYPENAMES)"
+const arrow=c=>_sortCol===c?(_sortDir>0?' ▾':' ▴'):'';
+let h='<tr><th class="sortable" onclick="sortContacts(\'name\')">Nazwa'+arrow('name')+'</th><th class="sortable" onclick="sortContacts(\'dist_km\')">Odległość'+arrow('dist_km')+'</th><th class="sortable" onclick="sortContacts(\'last_advert\')">Aktywność'+arrow('last_advert')+'</th><th></th></tr>';
+window._cd.forEach(c=>{
+  const dst=c.dist_km?c.dist_km+' km':'—';
+  const rel=_relTime(c.last_advert);
+  const fresh=c.last_advert&&(Date.now()/1000-c.last_advert<3600);
+  const stale=c.last_advert&&(Date.now()/1000-c.last_advert>86400*7);
+  h+='<tr><td>'+esc(c.name)+'</td><td>'+dst+'</td><td style="color:'+(fresh?'var(--good)':stale?'var(--text-faint)':'var(--text-dim)')+'">'+rel+'</td><td style="text-align:right"><button class="btn btn-sm" onclick="showContact(\''+c.key+'\')">Szczegóły</button></td></tr>';
+});
+t.innerHTML=h;}
 const CONTACT_TYPES={0:'NONE',1:'Klient',2:'Repeater',3:'Room',4:'Sensor'};
 function showContact(key){const c=window._cd.find(x=>x.key===key);if(!c)return;
 document.getElementById('cd-name').textContent=c.name;
@@ -923,13 +1364,19 @@ document.getElementById('cd-last').textContent=c.last_seen||'-';
 document.getElementById('cd-mod').textContent=c.lastmod?'data modyfikacji: '+(new Date(c.lastmod*1e3).toLocaleString('pl-PL')):'-';
 document.getElementById('cd-path').textContent=c.path_len!=null&&c.path_len>=0?'Hopy: '+(c.path_len+1)+', hash: '+(c.path_hash||'?'):'brak';
 document.getElementById('cd-raw').textContent=c._raw?JSON.stringify(c._raw,null,2):'';
-document.getElementById('contact-detail').style.display='block';}
+document.getElementById('contact-detail').style.display='block';
+document.getElementById('contact-detail').scrollIntoView({behavior:'smooth',block:'nearest'});}
 function closeDetail(){document.getElementById('contact-detail').style.display='none';}
 function toggleRaw(){const e=document.getElementById('cd-raw');e.style.display=e.style.display==='none'?'block':'none';}
-function copyKey(){const k=document.getElementById('cd-key').textContent;navigator.clipboard.writeText(k).then(()=>{const b=event.target;b.textContent='✅';setTimeout(()=>b.textContent='📋',1500);}).catch(()=>{prompt('Ręcznie skopiuj:',k);});}
-async function chatRefresh(){const r=await fetch('/api/messages');const d=await r.json();const ch=document.getElementById('chat-chan').value;const el=document.getElementById('chat-msgs');let h='';d.forEach(m=>{if(m.ch.replace('CH','')==ch||ch==='*'){const me=m.dir==='out';h+='<div style="margin-bottom:8px;padding:8px;border-radius:8px;border:1px solid '+(me?'#1a3a2a':'#1a2a3a')+';background:'+(me?'#0a1a0e':'#0a1218')+'"><div style="font-size:11px;color:#8899b0;margin-bottom:3px">'+(me?'<b style="color:#66b8ff">JA</b>':'<b style="color:#88cc66">'+esc(m.from)+'</b>')+' <span style="color:#556">'+m.ts+'</span> '+m.ch+'</div><div style="line-height:1.5">'+esc(m.text)+'</div></div>'}});el.innerHTML=h||'<div style="color:#8899b0;text-align:center;padding:20px">Brak wiadomosci w kanale '+ch+'</div>';el.scrollTop=el.scrollHeight;}
-async function chatSend(){const inp=document.getElementById('chat-input');const t=inp.value.trim();if(!t)return;const ch=document.getElementById('chat-chan').value;const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),text:t})});const d=await r.json();if(d.ok){inp.value='';chatRefresh();if(d.acks!==undefined){const el=document.getElementById('chat-msgs');el.innerHTML+='<div style=\"font-size:11px;color:#ffaa44;padding:2px 8px\">📡 Odebrano przez '+d.acks+' repeater(ow)</div>';el.scrollTop=el.scrollHeight;setTimeout(chatRefresh,5000)}}else{alert('Blad: '+(d.error||'?'))}}
+function copyKey(){const k=document.getElementById('cd-key').textContent;navigator.clipboard.writeText(k).then(()=>toast('Skopiowano klucz','good')).catch(()=>{prompt('Ręcznie skopiuj:',k);});}
+
+function setChan(n){document.getElementById('chat-chan').value=n;
+document.querySelectorAll('#chat-chips .chip').forEach(c=>c.classList.toggle('active',+c.dataset.ch===n));
+chatRefresh();}
+async function chatRefresh(){const r=await fetch('/api/messages');const d=await r.json();const ch=document.getElementById('chat-chan').value;const el=document.getElementById('chat-msgs');let h='';d.forEach(m=>{if(m.ch.replace('CH','')==ch||ch==='*'){const me=m.dir==='out';h+='<div class="bubble '+(me?'out':'in')+'"><div class="meta">'+(me?'JA':esc(m.from))+' · '+m.ts+' · '+m.ch+'</div><div>'+esc(m.text)+'</div></div>'}});el.innerHTML=h||'<div class="empty">Brak wiadomości w kanale '+ch+'</div>';el.scrollTop=el.scrollHeight;}
+async function chatSend(){const inp=document.getElementById('chat-input');const t=inp.value.trim();if(!t)return;const ch=document.getElementById('chat-chan').value;const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:parseInt(ch),text:t})});const d=await r.json();if(d.ok){inp.value='';chatRefresh();if(d.acks!==undefined){toast('Odebrano przez '+d.acks+' repeater(ów)');setTimeout(chatRefresh,5000)}}else{toast('Błąd: '+(d.error||'?'),'bad')}}
 setInterval(function(){if(document.getElementById('page-chat').style.display!=='none')chatRefresh()},3000);
+
 async function loadDeviceCards(){const r=await fetch('/api/device/info');if(r.status===401){showLoginAgain();return};if(!r.ok)return;const d=await r.json();
 const dev=d.device||{};const self=d.self||{};
 if(self.adv_lat!=null&&self.adv_lon!=null){
@@ -937,16 +1384,14 @@ if(self.adv_lat!=null&&self.adv_lon!=null){
 const cards=[
   {v:dev.model||'?',l:'Model'},{v:dev.ver||'?',l:'Firmware'},
   {v:self.adv_name||self.name||'?',l:'Nazwa'},
-  {v:self.radio_freq!=null?self.radio_freq+' MHz':'?',l:'Czestotliwosc'},
+  {v:self.radio_freq!=null?self.radio_freq+' MHz':'?',l:'Częstotliwość'},
   {v:'SF'+(self.radio_sf||'?'),l:'SF'},
   {v:self.last_snr!=null?self.last_snr+' dB':'?',l:'Ostatni SNR'},
   {v:self.last_rssi!=null?self.last_rssi+' dBm':'?',l:'Ostatni RSSI'},
 ];
-// Fetch stats separately for battery
 try{const sr=await fetch('/api/device/stats');const sd=await sr.json();
   cards.push({v:sd.bat&&sd.bat.level?sd.bat.level+' mV':'?',l:'Bateria'});}catch(e){cards.push({v:'?',l:'Bateria'});}
-document.getElementById('device-cards').innerHTML=cards.map(c=>`<div class="card"><div class="val">${esc(c.v)}</div><div class="lbl">${c.l}</div></div>`).join('');
-// System info
+document.getElementById('device-cards').innerHTML=cards.map(c=>`<div class="stat-card"><div class="stat-value">${esc(c.v)}</div><div class="stat-label">${c.l}</div></div>`).join('');
 const sr=await fetch('/api/system');const sys=await sr.json();
 const sysCards=[
   {v:sys.hostname||'?',l:'Hostname'},{v:sys.ip||'?',l:'IP'},
@@ -954,13 +1399,13 @@ const sysCards=[
   {v:sys.disk||'?',l:'Disk'},{v:sys.cpu_temp||'?',l:'CPU Temp'},
   {v:sys.arch||'?',l:'Architektura'},
 ];
-document.getElementById('sys-cards').innerHTML=sysCards.map(c=>`<div class="card"><div class="val">${esc(c.v)}</div><div class="lbl">${c.lbl||c.l}</div></div>`).join()+
-  '<div style="margin-top:8px;display:flex;gap:8px"><button onclick="loadDeviceCards()" style="padding:6px 14px;background:#1e3a5f;border:none;border-radius:6px;color:#66b8ff;cursor:pointer;font-size:12px">Przeladuj metryki</button>'+
-  '<button onclick="rebootPi()" style="padding:6px 14px;background:#5f1e1e;border:none;border-radius:6px;color:#ff6666;cursor:pointer;font-size:12px">Reboot Pi</button></div>';}
+document.getElementById('sys-cards').innerHTML=sysCards.map(c=>`<div class="stat-card"><div class="stat-value">${esc(c.v)}</div><div class="stat-label">${c.l}</div></div>`).join('')+
+  '<div style="grid-column:1/-1;display:flex;gap:8px;margin-top:2px"><button class="btn btn-sm" onclick="loadDeviceCards()">Przeładuj metryki</button>'+
+  '<button class="btn btn-sm btn-danger" onclick="rebootPi()">Reboot Pi</button></div>';}
 
-async function rebootPi(){if(!confirm('Na pewno zrestartowac Raspberry Pi?'))return;
+async function rebootPi(){if(!confirm('Na pewno zrestartować Raspberry Pi?'))return;
 const r=await fetch('/api/system/reboot-pi',{method:'POST',headers:{'Content-Type':'application/json'}});
-const d=await r.json();alert(d.msg||d.error||'OK');}
+const d=await r.json();toast(d.msg||d.error||'OK',d.error?'bad':'good');}
 async function loadDeviceInfo(){const r=await fetch('/api/device/info');const d=await r.json();
 document.getElementById('device-info').textContent=JSON.stringify(d,null,2);
 if(d.self){const s=d.self;if(s.name)document.getElementById('cfg-name').value=s.name;
@@ -968,11 +1413,18 @@ if(s.tx_power)document.getElementById('cfg-txp').value=s.tx_power;
 if(s.radio_freq)document.getElementById('cfg-freq').value=s.radio_freq;
 if(s.radio_bw)document.getElementById('cfg-bw').value=s.radio_bw;
 if(s.radio_sf)document.getElementById('cfg-sf').value=s.radio_sf;
-if(s.radio_cr)document.getElementById('cfg-cr').value=s.radio_cr;}}
-async function setCfg(data){const r=await fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const d=await r.json();alert(JSON.stringify(d.results||d.error));}
+if(s.radio_cr)document.getElementById('cfg-cr').value=s.radio_cr;
+if(s.multi_acks!==undefined)document.getElementById('cfg-macks').checked=!!s.multi_acks;
+if(s.manual_add_contacts!==undefined)document.getElementById('cfg-mac').checked=!!s.manual_add_contacts;
+if(s.advert_loc_policy!==undefined)document.getElementById('cfg-alp').value=s.advert_loc_policy;
+if(s.path_hash_mode!==undefined)document.getElementById('cfg-phm').value=s.path_hash_mode;}}
+async function setCfg(data){const r=await fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+const d=await r.json();
+if(d.results){const failed=d.results.filter(x=>!x.ok);toast(failed.length?failed.length+' błędów zapisu':'Zapisano pomyślnie',failed.length?'bad':'good');}
+else{toast(d.error||'Błąd zapisu','bad');}}
 async function loadStats(){const r=await fetch('/api/device/stats');const d=await r.json();document.getElementById('stats-display').textContent=JSON.stringify(d,null,2);}
 async function loadChannels(){const r=await fetch('/api/device/channels');const d=await r.json();document.getElementById('channels-display').textContent=JSON.stringify(d,null,2);}
-// History functions
+
 let _histPage=0,_histTotal=0;
 async function histLoad(page){
   _histPage=page||0;
@@ -989,29 +1441,55 @@ function histRender(msgs){
   msgs.forEach(m=>{
     const ts=m.ts?m.ts.replace('T',' ').substring(0,19):'?';
     const me=m.dir==='out';
-    h+='<div style="margin-bottom:6px;padding:6px 8px;border-radius:6px;border:1px solid '+(me?'#1a3a2a':'#1a2a3a')+';background:'+(me?'#0a1a0e':'#0a1218')+'">'+
-      '<span style="font-size:11px;color:#556677">'+esc(ts)+'</span> '+
-      '<span style="color:'+(me?'#66b8ff':'#88cc66')+'">'+(me?'<b>JA</b>':esc(m.sender))+'</span> '+
-      '<span style="color:#556677">['+esc(m.ch)+']</span> '+
-      '<span>'+esc(m.text)+'</span></div>';
+    h+='<div class="hist-row"><span class="t">'+esc(ts)+'</span><b style="color:'+(me?'var(--accent)':'var(--good)')+'">'+(me?'JA':esc(m.sender))+'</b> <span style="color:var(--text-faint)">['+esc(m.ch)+']</span> '+esc(m.text)+'</div>';
   });
-  document.getElementById('hist-results').innerHTML=h||'<div style="color:#556677;padding:20px;text-align:center">Brak wynikow</div>';
+  document.getElementById('hist-results').innerHTML=h||'<div class="empty">Brak wyników</div>';
   const totalPages=Math.ceil(_histTotal/50);
-  let pager='Strona ' + (_histPage+1) + ' z ' + (totalPages||1) + ' (' + _histTotal + ' wiadomosci) ';
-  if(_histPage>0)pager+='<button onclick="histLoad('+(_histPage-1)+')" style="background:#1a2a3a;border:none;color:#66b8ff;padding:4px 10px;border-radius:4px;cursor:pointer">&lt; Wstecz</button> ';
-  if((_histPage+1)*50<_histTotal)pager+='<button onclick="histLoad('+(_histPage+1)+')" style="background:#1a2a3a;border:none;color:#66b8ff;padding:4px 10px;border-radius:4px;cursor:pointer">Dalej &gt;</button>';
+  let pager='Strona ' + (_histPage+1) + ' z ' + (totalPages||1) + ' (' + _histTotal + ' wiadomości) ';
+  if(_histPage>0)pager+='<button class="btn btn-sm" onclick="histLoad('+(_histPage-1)+')">&lt; Wstecz</button> ';
+  if((_histPage+1)*50<_histTotal)pager+='<button class="btn btn-sm" onclick="histLoad('+(_histPage+1)+')">Dalej &gt;</button>';
   document.getElementById('hist-pager').innerHTML=pager;
 }
-// SPA navigation
-document.querySelectorAll('.nav a').forEach(a=>{a.addEventListener('click',function(e){e.preventDefault();
-document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('active'));this.classList.add('active');
+
+async function loadPackets(){
+  const r=await fetch('/api/packets?limit=100');
+  if(r.status===401){showLoginAgain();return}
+  const d=await r.json();
+  const el=document.getElementById('packets-list');
+  if(!d.packets||!d.packets.length){el.innerHTML='<div class="empty">Brak zarejestrowanych pakietów</div>';return}
+  let h='';
+  d.packets.forEach(p=>{
+    const ts=p.ts?p.ts.replace('T',' ').substring(0,19):'?';
+    const hops=p.path_hops||0;
+    const snr=p.snr!=null?p.snr.toFixed(1)+' dB':'—';
+    const obs=p.observers||0;
+    const obsList=p.observer_list?p.observer_list.split(',').join(', '):'';
+    h+='<div class="hist-row">'+
+      '<span class="t">'+esc(ts)+'</span>'+
+      '<b style="color:var(--good)">'+esc(p.sender)+'</b>'+
+      ' <span style="color:var(--text-faint)">['+esc(p.ch)+']</span> '+
+      '<span style="color:var(--text-dim)">'+esc((p.text||'').substring(0,80))+'</span>'+
+      '<div style="margin-top:4px;font-size:11px;color:var(--text-faint)">'+
+      '<span style="color:var(--accent)">Hopy: '+hops+'</span>'+
+      ' · SNR: '+snr+
+      (obs?' · <span style="color:var(--accent)">Obserwatorzy: '+obs+'</span> ('+esc(obsList)+')':'')+
+      '</div></div>';
+  });
+  el.innerHTML=h;
+}
+
+const pageTitles={dashboard:'Panel',chat:'Czat',config:'Konfiguracja',history:'Historia',packets:'Pakiety'};
+document.querySelectorAll('.nav-item').forEach(a=>{a.addEventListener('click',function(e){e.preventDefault();
+document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));this.classList.add('active');
 document.querySelectorAll('#app>div').forEach(x=>x.style.display='none');
 const page=document.getElementById('page-'+this.dataset.page);
-if(page){page.style.display='block'}
+if(page){page.style.display='flex'}
+document.getElementById('page-title').textContent=pageTitles[this.dataset.page]||'';
 if(this.dataset.page==='dashboard'){load();loadLog();loadDeviceCards();loadContacts();if(_map)setTimeout(()=>_map.invalidateSize(),100)};
 if(this.dataset.page==='chat')chatRefresh();
 if(this.dataset.page==='config'){loadDeviceInfo();loadStats();loadChannels()};
 if(this.dataset.page==='history')histLoad(0);
+if(this.dataset.page==='packets')loadPackets();
 })})
 </script>
 </body>
@@ -1020,12 +1498,13 @@ if(this.dataset.page==='history')histLoad(0);
 LOG_HTML = """<!DOCTYPE html>
 <html lang="pl">
 <head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
-<title>Log - MeshCore Bridge</title>
-<style>body{background:#080c14;color:#aabbcc;font:12px/1.6 'Consolas',monospace;padding:10px}.ts{color:#556677}</style>
+<title>Log — MeshCore Bridge</title>
+<style>
+body{background:#0a0e13;color:#c9d3df;font:12px/1.7 'IBM Plex Mono',ui-monospace,monospace;padding:16px}
+.ts{color:#576172;margin-right:8px}
+</style>
 </head>
 <body><pre>""" + '{% for line in log %}<span class="ts">{{ line[:8] }}</span>{{ line[8:] }}\n{% endfor %}</pre></body></html>'
-
-
 def build_status(mc) -> dict:
     node_list = sorted(_seen_nodes.keys())
     my_lat = _self_info.get("adv_lat")
@@ -1151,6 +1630,11 @@ async def start_web():
             return JSONResponse({"error": "Not connected"})
         try:
             result = {"self": _self_info}
+            try:
+                phm = await asyncio.wait_for(_mc_ref.commands.get_path_hash_mode(), timeout=3)
+                result["self"]["path_hash_mode"] = phm
+            except Exception:
+                pass
             r = await asyncio.wait_for(_mc_ref.commands.send_device_query(), timeout=5)
             if r.type.name != "ERROR":
                 _device_info = r.payload
@@ -1197,7 +1681,11 @@ async def start_web():
                         else:
                             dist = _haversine(my_lat, my_lon, lat, lon)
                     last_ts = c.get("lastmod")  # our clock — when we received it
-                    adv_ts = c.get("last_advert")  # remote clock — may drift
+                    adv_ts = c.get("last_advert")  # remote clock — may drift (or uptime counter if no sync)
+                    # Sanity: timestamps < 1e9 (before Sep 2001) are uptime counters
+                    # from devices without clock sync, not real Unix time.
+                    if adv_ts and adv_ts < 1000000000:
+                        adv_ts = last_ts  # fall back to our local receipt time
                     last_str = _fmt_ts(last_ts)
                     if adv_ts:
                         adv_str = _fmt_ts(adv_ts)
@@ -1220,6 +1708,7 @@ async def start_web():
                         "tx_power": c.get("tx_power"),
                         "last_seen": last_str,
                         "lastmod": c.get("lastmod"),
+                        "last_advert": adv_ts,  # corrected — uptime counters fallen back to lastmod
                         "public_key": c.get("public_key") or None,
                         "path_len": c.get("out_path_len"),
                         "path_hash": c.get("out_path_hash_mode"),
@@ -1273,6 +1762,11 @@ async def start_web():
             return JSONResponse({"error": r.payload.get("reason", "unknown") if r.payload else "unknown"})
         except Exception as e:
             return JSONResponse({"error": str(e)})
+
+    @app.get("/api/packets")
+    async def api_packets(request: Request, limit: int = 100):
+        rows = _db_get_packets(min(limit, _MAX_PACKETS))
+        return JSONResponse({"packets": rows, "total": len(rows)})
 
     @app.get("/api/system")
     async def api_system():
@@ -1413,6 +1907,9 @@ async def start_web():
                        _mc_ref.commands.set_multi_acks(bool(body["multi_acks"])))
         if "flood_scope" in body:
             await _run("set_flood_scope", _mc_ref.commands.set_flood_scope(str(body["flood_scope"])))
+        if "path_hash_mode" in body:
+            await _run("set_path_hash_mode",
+                       _mc_ref.commands.set_path_hash_mode(int(body["path_hash_mode"])))
 
         return JSONResponse({"results": results})
 
@@ -1535,8 +2032,12 @@ async def main():
         _log("Blad: brak odpowiedzi z Helteca po 10 probach")
         sys.exit(1)
 
-    # Manual poller: MeshOS 2.0 doesn't fire MESSAGES_WAITING events,
-    # so auto-fetch never triggers. Poll directly every 10 seconds.
+    # Start auto-fetch: initializes library's internal event reader
+    # that dispatches CONTACT_MSG_RECV, CHANNEL_MSG_RECV, ADVERTISEMENT, ACK.
+    await mc.start_auto_message_fetching()
+    _log("Auto-fetch started, event reader active")
+
+    # Safety net poller: in case auto-fetch stalls, poll directly every 10s.
     global _last_rx_ts
     _last_rx_ts = time.time()  # initialize as alive after successful connect
     async def _keep_alive_poller():
