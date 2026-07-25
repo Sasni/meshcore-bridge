@@ -1756,6 +1756,7 @@ async def start_web():
             r = await asyncio.wait_for(_mc_ref.commands.send_chan_msg(ch, text), timeout=5)
             if r.type.name != "ERROR":
                 _push_msg("out", f"CH{ch}", "JA", text)
+                _track_packet("JA", "", text, f"CH{ch}", "", 0, None, None)
                 _log(f"-> kanal{ch}: {text[:60]}")
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
                 return JSONResponse({"ok": True, "acks": len(_msg_acks.get(text, set()))})
