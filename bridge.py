@@ -2044,15 +2044,16 @@ async def main():
     # Enable decrypted channel logs → path, SNR, RSSI in channel messages
     mc.set_decrypt_channel_logs(True)
     async def _load_channels():
+        import asyncio as _asyncio
         try:
-            r = await asyncio.wait_for(mc.commands.send_device_query(), timeout=5)
-            max_ch = r.payload.get("max_channels", 8) if r.payload else 8
+            r = await _asyncio.wait_for(mc.commands.send_device_query(), timeout=5)
+            max_ch = min(r.payload.get("max_channels", 8) if r.payload else 8, 8)
         except Exception:
             max_ch = 8
         loaded = 0
         for idx in range(max_ch):
             try:
-                await asyncio.wait_for(mc.commands.get_channel(idx), timeout=2)
+                await _asyncio.wait_for(mc.commands.get_channel(idx), timeout=2)
                 loaded += 1
             except Exception:
                 pass
