@@ -2041,6 +2041,24 @@ async def main():
     await mc.start_auto_message_fetching()
     _log("Auto-fetch started, event reader active")
 
+    # Enable decrypted channel logs → path, SNR, RSSI in channel messages
+    mc.set_decrypt_channel_logs(True)
+    async def _load_channels():
+        try:
+            r = await asyncio.wait_for(mc.commands.send_device_query(), timeout=5)
+            max_ch = r.payload.get("max_channels", 8) if r.payload else 8
+        except Exception:
+            max_ch = 8
+        loaded = 0
+        for idx in range(max_ch):
+            try:
+                await asyncio.wait_for(mc.commands.get_channel(idx), timeout=2)
+                loaded += 1
+            except Exception:
+                pass
+        _log(f"Decrypt channels: {loaded}/{max_ch} loaded")
+    asyncio.create_task(_load_channels())
+
     # Safety net poller: in case auto-fetch stalls, poll directly every 10s.
     global _last_rx_ts
     _last_rx_ts = time.time()  # initialize as alive after successful connect
