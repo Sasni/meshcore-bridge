@@ -2158,7 +2158,7 @@ async def main():
         while True:
             try:
                 # Wait for firmware push or 10s fallback
-                await asyncio.wait_for(_msg_waiting.wait(), timeout=10)
+                await asyncio.wait_for(_msg_waiting.wait(), timeout=30)
             except asyncio.TimeoutError:
                 pass  # no push, poll anyway
             _msg_waiting.clear()
@@ -2176,10 +2176,10 @@ async def main():
     async def _connection_watchdog():
         global _last_rx_ts
         TIMEOUT_S = 120
-        MAX_FAILS = 3  # consecutive failed pings before proxy restart
+        MAX_FAILS = 5  # consecutive failed pings before proxy restart
         fails = 0
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
             try:
                 # Active ping — get_time with timeout detects dead TCP
                 r = await asyncio.wait_for(mc.commands.get_time(), timeout=8)
