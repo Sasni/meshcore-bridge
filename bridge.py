@@ -75,8 +75,8 @@ _rate_limits: dict[str, list[float]] = {}  # ip → list of request timestamps
 _log_buffer: list = []  # rolling log buffer for web UI
 MAX_LOG = 200
 RATE_LIMIT_WINDOW = 10  # seconds
-RATE_SEND_MAX = 3       # max sends per window
-RATE_GET_MAX = 30       # max GETs per window
+RATE_SEND_MAX = 10      # max sends per window
+RATE_GET_MAX = 60       # max GETs per window
 
 WEB_PORT = int(os.environ.get("PORT", "8080"))
 
@@ -1207,6 +1207,14 @@ pre.raw{background:var(--bg);border:1px solid var(--border-soft);border-radius:v
             <div class="panel-head"><h2>Zaawansowane</h2></div>
             <div class="panel-body">
               <div class="hint" style="margin-bottom:10px">Opcje dla zaawansowanych. Zmieniaj tylko jeśli wiesz co robisz.</div>
+              <div class="field"><label>Path Hash Mode</label>
+                <select id="cfg-phm" onchange="setCfg({path_hash_mode:+this.value})">
+                  <option value="0">0 — 1 bajt (254 ID, 64 hopy, legacy)</option>
+                  <option value="1">1 — 2 bajty (65k ID, 32 hopy, zalecany)</option>
+                  <option value="2">2 — 3 bajty (16M ID, 21 hopów, gęste sieci)</option>
+                </select>
+                <div class="hint">Zmiana wymaga wysłania Advert. <a href="https://nodakmesh.org/blog/meshcore-path-hash-explained" target="_blank" style="color:var(--accent)">Więcej info</a></div>
+              </div>
               <label class="check"><input id="cfg-macks" type="checkbox"> Multi ACKs <span class="note">(wysyła 2 potwierdzenia zamiast 1)</span></label>
               <button class="btn btn-sm" onclick="setCfg({multi_acks:document.getElementById('cfg-macks').checked?1:0})">Ustaw</button>
               <div class="field" style="margin-top:12px"><label>Flood Scope</label><input id="cfg-fs" type="text" placeholder="#public"></div>
@@ -1405,7 +1413,11 @@ if(s.tx_power)document.getElementById('cfg-txp').value=s.tx_power;
 if(s.radio_freq)document.getElementById('cfg-freq').value=s.radio_freq;
 if(s.radio_bw)document.getElementById('cfg-bw').value=s.radio_bw;
 if(s.radio_sf)document.getElementById('cfg-sf').value=s.radio_sf;
-if(s.radio_cr)document.getElementById('cfg-cr').value=s.radio_cr;}}
+if(s.radio_cr)document.getElementById('cfg-cr').value=s.radio_cr;
+if(s.multi_acks!==undefined)document.getElementById('cfg-macks').checked=!!s.multi_acks;
+if(s.manual_add_contacts!==undefined)document.getElementById('cfg-mac').checked=!!s.manual_add_contacts;
+if(s.advert_loc_policy!==undefined)document.getElementById('cfg-alp').value=s.advert_loc_policy;
+if(s.path_hash_mode!==undefined)document.getElementById('cfg-phm').value=s.path_hash_mode;}}
 async function setCfg(data){const r=await fetch('/api/device/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
 const d=await r.json();
 if(d.results){const failed=d.results.filter(x=>!x.ok);toast(failed.length?failed.length+' błędów zapisu':'Zapisano pomyślnie',failed.length?'bad':'good');}
@@ -1618,6 +1630,11 @@ async def start_web():
             return JSONResponse({"error": "Not connected"})
         try:
             result = {"self": _self_info}
+            try:
+                phm = await asyncio.wait_for(_mc_ref.commands.get_path_hash_mode(), timeout=3)
+                result["self"]["path_hash_mode"] = phm
+            except Exception:
+                pass
             r = await asyncio.wait_for(_mc_ref.commands.send_device_query(), timeout=5)
             if r.type.name != "ERROR":
                 _device_info = r.payload
@@ -1890,6 +1907,9 @@ async def start_web():
                        _mc_ref.commands.set_multi_acks(bool(body["multi_acks"])))
         if "flood_scope" in body:
             await _run("set_flood_scope", _mc_ref.commands.set_flood_scope(str(body["flood_scope"])))
+        if "path_hash_mode" in body:
+            await _run("set_path_hash_mode",
+                       _mc_ref.commands.set_path_hash_mode(int(body["path_hash_mode"])))
 
         return JSONResponse({"results": results})
 
