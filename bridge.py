@@ -2037,16 +2037,26 @@ async def main():
 
     res = None
     retries = 10
-    while retries > 0:
+    while True:
         res = await mc.connect()
         if res is not None and res.type != meshcore.EventType.ERROR:
             break
         retries -= 1
-        _log(f"Retry polaczenia... ({retries} prob)")
-        await asyncio.sleep(5)
-    if res is None or res.type == meshcore.EventType.ERROR:
-        _log("Blad: brak odpowiedzi z Helteca po 10 probach")
-        sys.exit(1)
+        if retries > 0:
+            _log(f"Retry polaczenia... ({retries} prob)")
+            await asyncio.sleep(5)
+        else:
+            _log("10 nieudanych prob — restartuje meshcore-proxy i probuje dalej...")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "sudo", "/usr/bin/systemctl", "restart", "meshcore-proxy",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL)
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+            retries = 10
 
     # Start auto-fetch: initializes library's internal event reader
     # that dispatches CONTACT_MSG_RECV, CHANNEL_MSG_RECV, ADVERTISEMENT, ACK.
