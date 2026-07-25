@@ -473,7 +473,7 @@ async def on_contact_message(mc, event):
          else datetime.now().strftime("%d.%m %H:%M"))
     s = f" [{snr:.1f}dB]" if snr is not None else ""
     msg = f"📡 <b>MeshCore</b> {t}\n👤 {esc(sender)}{s}\n\n{esc(text)}\n\n\u2014\n💬 Odpisz: /r {esc(sender)} <tekst>"
-    _log(f"<- od {sender}: {text[:60]}")
+    _log(f"<- od {sender}: {text[:60]}" + (f" [{snr:.1f}dB]" if snr is not None else ""))
     _push_msg("in", "DM", sender, text)
     # Track packet
     path_str = p.get("path", "")
@@ -2030,6 +2030,10 @@ async def main():
                  lambda e: asyncio.create_task(on_advert(mc, e)))
     mc.subscribe(meshcore.EventType.ACK,
                  lambda e: asyncio.create_task(on_ack(mc, e)))
+    # MESSAGES_WAITING: firmware push → wake poller immediately
+    _msg_waiting = asyncio.Event()
+    mc.subscribe(meshcore.EventType.MESSAGES_WAITING,
+                 lambda e: _msg_waiting.set())
 
     # Start web UI immediately (independent of device connection)
     web_task = asyncio.create_task(start_web())
@@ -2082,13 +2086,18 @@ async def main():
         _log(f"Decrypt channels: {loaded}/{max_ch} loaded")
     asyncio.create_task(_load_channels())
 
-    # Safety net poller: in case auto-fetch stalls, poll directly every 10s.
+    # Poller: wakes on MESSAGES_WAITING event, falls back to 10s interval.
     global _last_rx_ts
     _last_rx_ts = time.time()  # initialize as alive after successful connect
     async def _keep_alive_poller():
         global _last_rx_ts
         while True:
-            await asyncio.sleep(10)
+            try:
+                # Wait for firmware push or 10s fallback
+                await asyncio.wait_for(_msg_waiting.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass  # no push, poll anyway
+            _msg_waiting.clear()
             try:
                 if mc.is_connected:
                     r = await mc.commands.get_msg()
