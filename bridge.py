@@ -9,6 +9,7 @@ Usage:
 """
 
 import asyncio, json, logging, os, sys, time, hashlib, sqlite3, threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,7 @@ _MSG_FILE = Path(CONFIG_PATH.parent, ".msg_history.json")
 _DB_FILE = Path(CONFIG_PATH.parent, "msg_history.db")  # SQLite full history
 _LOG_FILE = Path(CONFIG_PATH.parent, ".bridge.log")
 _MAX_PERSIST_LOG = 5 * 1024 * 1024  # 5 MB log rotation
+_state_lock = threading.RLock()  # Shared by async tasks, startup/shutdown code, and the log worker.
 _log_io_lock = threading.Lock()
 _log_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-log")
 
@@ -52,6 +54,8 @@ _packet_observers: dict[int, set] = {}  # packet_id -> set of observer keys that
 _packet_ack_targets: dict[str, int] = {}  # ack key -> packet_id
 _packet_recent_keys: dict[str, float] = {}  # fingerprint -> last seen monotonic ts
 _MAX_PACKETS = 500
+_PACKET_PRUNE_EVERY = 25  # prune in batches so packet inserts stay cheap under load
+_packet_inserts_since_prune = 0
 _send_datagram_fn = None  # set by main() for start_web() API endpoint
 _send_dm_ack_fn = None  # set by main() for handle_tg_cmd /r
 
@@ -79,10 +83,10 @@ _device_contact_count: int = 0  # cached count from device contacts
 _msg_history: list[dict] = []  # structured message history for chat UI
 MAX_MSG_HISTORY = 100
 _rate_limits: dict[str, list[float]] = {}  # ip → list of request timestamps
-_log_buffer: list = []  # rolling log buffer for web UI
+_log_buffer = deque(maxlen=MAX_LOG)  # rolling log buffer for web UI
 MAX_LOG = 200
-RATE_LIMIT_WINDOW = 10  # seconds
-RATE_SEND_MAX = 10      # max sends per window
+RATE_LIMIT_WINDOW = 10  # 10 s keeps bursts small without penalizing normal UI polling.
+RATE_SEND_MAX = 10      # 10 writes / 10 s is enough for chat use and blocks spam bursts.
 RATE_GET_MAX = 60       # max GETs per window
 _warn_last_ts: dict[str, float] = {}  # key -> last warning timestamp (for throttling)
 
@@ -93,13 +97,16 @@ def _rate_check(request, limit: int) -> bool:
     ip = request.client.host if request.client else "unknown"
     now = time.time()
     cutoff = now - RATE_LIMIT_WINDOW
-    timestamps = [t for t in _rate_limits.get(ip, []) if t > cutoff]
-    if len(timestamps) >= limit:
-        return False
-    timestamps.append(now)
-    _rate_limits[ip] = timestamps
-    if len(_rate_limits) > 1000:
-        _rate_limits.clear()
+    with _state_lock:
+        timestamps = [t for t in _rate_limits.get(ip, []) if t > cutoff]
+        if len(timestamps) >= limit:
+            return False
+        timestamps.append(now)
+        _rate_limits[ip] = timestamps
+        if len(_rate_limits) > 1000:
+            # Evict the oldest inactive IP buckets instead of resetting everyone.
+            oldest_ip = min(_rate_limits.items(), key=lambda item: item[1][-1] if item[1] else 0.0)[0]
+            _rate_limits.pop(oldest_ip, None)
     return True
 
 
@@ -109,7 +116,7 @@ async def _mc_call(coro, timeout: float = 5):
     Companion Protocol documentation recommends one command at a time.
     """
     if _mc_cmd_lock is None:
-        return await asyncio.wait_for(coro, timeout=timeout)
+        raise RuntimeError("MeshCore command lock is not initialized")
     async with _mc_cmd_lock:
         return await asyncio.wait_for(coro, timeout=timeout)
 
@@ -183,9 +190,8 @@ def _persist_log_line(line: str):
 def _log(msg: str):
     log.info(msg)
     line = f"{datetime.now().strftime('%H:%M:%S')} {msg}"
-    _log_buffer.append(line)
-    if len(_log_buffer) > MAX_LOG:
-        _log_buffer.pop(0)
+    with _state_lock:
+        _log_buffer.append(line)
     try:
         loop = asyncio.get_running_loop()
         loop.run_in_executor(_log_executor, _persist_log_line, line)
@@ -195,11 +201,15 @@ def _log(msg: str):
     except Exception as e:
         print(f"[bridge] Log enqueue failed: {e}", file=sys.stderr)
 
-def _save_msg_file():
+def _save_msg_file_sync():
     try:
         _MSG_FILE.write_text(json.dumps(list(_msg_history), ensure_ascii=False))
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Nie mozna zapisac historii wiadomosci do {_MSG_FILE}: {e}")
+
+
+async def _save_msg_file():
+    await asyncio.to_thread(_save_msg_file_sync)
 
 def _load_msg_file():
     try:
@@ -208,8 +218,10 @@ def _load_msg_file():
             if isinstance(data, list):
                 _msg_history.clear()
                 _msg_history.extend(data[-MAX_MSG_HISTORY:])
-    except Exception:
-        pass
+            else:
+                log.warning(f"Historia wiadomosci w {_MSG_FILE} ma nieoczekiwany format: {type(data).__name__}")
+    except Exception as e:
+        log.warning(f"Nie mozna wczytac historii wiadomosci z {_MSG_FILE}: {e}")
 
 
 async def _delayed_reboot(delay_s: int = 3):
@@ -243,46 +255,52 @@ async def _delayed_reboot(delay_s: int = 3):
 # ── SQLite message history ────────────────────────────────────
 def _init_db():
     """Initialize SQLite DB for full message history."""
-    db = sqlite3.connect(str(_DB_FILE))
-    db.execute("CREATE TABLE IF NOT EXISTS messages ("
-               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-               "ts TEXT NOT NULL,"       # ISO timestamp
-               "dir TEXT NOT NULL,"      # 'in' or 'out'
-               "ch TEXT NOT NULL,"       # 'CH0', 'DM', etc.
-               "sender TEXT NOT NULL,"
-               "text TEXT NOT NULL)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ch ON messages(ch)")
-    db.execute("PRAGMA journal_mode=WAL")  # better concurrency
-    db.execute("CREATE TABLE IF NOT EXISTS packets ("
-               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-               "ts TEXT NOT NULL,"
-               "sender TEXT NOT NULL,"
-               "sender_key TEXT,"
-               "text TEXT,"
-               "ch TEXT NOT NULL,"
-               "path TEXT,"
-               "path_hops INTEGER DEFAULT 0,"
-               "snr REAL,"
-               "rssi REAL,"
-               "observers INTEGER DEFAULT 0,"
-               "observer_list TEXT,"
-               "raw_payload TEXT)")
-    db.execute("CREATE INDEX IF NOT EXISTS idx_packets_ts ON packets(ts)")
-    db.commit()
-    db.close()
+    with sqlite3.connect(str(_DB_FILE)) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS messages ("
+                   "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                   "ts TEXT NOT NULL,"       # ISO timestamp
+                   "dir TEXT NOT NULL,"      # 'in' or 'out'
+                   "ch TEXT NOT NULL,"       # 'CH0', 'DM', etc.
+                   "sender TEXT NOT NULL,"
+                   "text TEXT NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_messages_ch ON messages(ch)")
+        db.execute("PRAGMA journal_mode=WAL")  # better concurrency
+        db.execute("CREATE TABLE IF NOT EXISTS packets ("
+                   "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                   "ts TEXT NOT NULL,"
+                   "sender TEXT NOT NULL,"
+                   "sender_key TEXT,"
+                   "text TEXT,"
+                   "ch TEXT NOT NULL,"
+                   "path TEXT,"
+                   "path_hops INTEGER DEFAULT 0,"
+                   "snr REAL,"
+                   "rssi REAL,"
+                   "observers INTEGER DEFAULT 0,"
+                   "observer_list TEXT,"
+                   "raw_payload TEXT)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_packets_ts ON packets(ts)")
+        db.commit()
+
+
+def _db_call(label: str, fallback, action):
+    """Run one SQLite operation with shared connection and error handling."""
+    try:
+        with sqlite3.connect(str(_DB_FILE)) as db:
+            return action(db)
+    except Exception as e:
+        print(f"[bridge] {label} error: {e}", file=sys.stderr)
+        return fallback
 
 def _db_insert(direction: str, channel: str, sender: str, text: str):
     """Insert a message into SQLite history."""
-    try:
-        db = sqlite3.connect(str(_DB_FILE))
-        db.execute(
-            "INSERT INTO messages (ts, dir, ch, sender, text) VALUES (?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), direction, channel, sender, text))
-        db.commit()
-        db.close()
-    except Exception as e:
-        print(f"[bridge] DB insert error: {e}", file=sys.stderr)
+    def _action(db):
+            db.execute(
+                "INSERT INTO messages (ts, dir, ch, sender, text) VALUES (?, ?, ?, ?, ?)",
+                (datetime.now().isoformat(), direction, channel, sender, text))
+            db.commit()
+    _db_call("DB insert", None, _action)
 
 
 async def _db_insert_async(direction: str, channel: str, sender: str, text: str):
@@ -291,25 +309,21 @@ async def _db_insert_async(direction: str, channel: str, sender: str, text: str)
 
 def _db_search(search: str = "", channel: str = "", limit: int = 100, offset: int = 0) -> list[dict]:
     """Search message history with optional filters. Returns list of dicts."""
-    try:
-        db = sqlite3.connect(str(_DB_FILE))
-        db.row_factory = sqlite3.Row
-        query = "SELECT ts, dir, ch, sender, text FROM messages WHERE 1=1"
-        params: list = []
-        if search:
-            query += " AND (text LIKE ? OR sender LIKE ?)"
-            params.extend([f"%{search}%", f"%{search}%"])
-        if channel:
-            query += " AND ch = ?"
-            params.append(channel)
-        query += " ORDER BY id DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        rows = db.execute(query, params).fetchall()
-        db.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        print(f"[bridge] DB search error: {e}", file=sys.stderr)
-        return []
+    def _action(db):
+            db.row_factory = sqlite3.Row
+            query = "SELECT ts, dir, ch, sender, text FROM messages WHERE 1=1"
+            params: list = []
+            if search:
+                query += " AND (text LIKE ? OR sender LIKE ?)"
+                params.extend([f"%{search}%", f"%{search}%"])
+            if channel:
+                query += " AND ch = ?"
+                params.append(channel)
+            query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            rows = db.execute(query, params).fetchall()
+            return [dict(r) for r in rows]
+    return _db_call("DB search", [], _action)
 
 
 async def _db_search_async(search: str = "", channel: str = "", limit: int = 100, offset: int = 0) -> list[dict]:
@@ -318,21 +332,17 @@ async def _db_search_async(search: str = "", channel: str = "", limit: int = 100
 
 def _db_count(search: str = "", channel: str = "") -> int:
     """Count total messages matching filters."""
-    try:
-        db = sqlite3.connect(str(_DB_FILE))
-        query = "SELECT COUNT(*) FROM messages WHERE 1=1"
-        params: list = []
-        if search:
-            query += " AND (text LIKE ? OR sender LIKE ?)"
-            params.extend([f"%{search}%", f"%{search}%"])
-        if channel:
-            query += " AND ch = ?"
-            params.append(channel)
-        count = db.execute(query, params).fetchone()[0]
-        db.close()
-        return count
-    except Exception:
-        return 0
+    def _action(db):
+            query = "SELECT COUNT(*) FROM messages WHERE 1=1"
+            params: list = []
+            if search:
+                query += " AND (text LIKE ? OR sender LIKE ?)"
+                params.extend([f"%{search}%", f"%{search}%"])
+            if channel:
+                query += " AND ch = ?"
+                params.append(channel)
+            return db.execute(query, params).fetchone()[0]
+    return _db_call("DB count", 0, _action)
 
 
 async def _db_count_async(search: str = "", channel: str = "") -> int:
@@ -342,22 +352,31 @@ async def _db_count_async(search: str = "", channel: str = "") -> int:
 def _db_insert_packet(sender: str, sender_key: str, text: str, ch: str,
                       path: str, path_hops: int, snr, rssi, raw_payload: str):
     """Insert a packet trace into the packets table."""
-    try:
-        db = sqlite3.connect(str(_DB_FILE))
+    def _action(db):
         db.execute(
             "INSERT INTO packets (ts, sender, sender_key, text, ch, path, path_hops, snr, rssi, raw_payload) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (datetime.now().isoformat(), sender, sender_key, text[:200] if text else "",
              ch, path, path_hops, snr, rssi, raw_payload))
         pid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-        # Prune old packets beyond _MAX_PACKETS
-        db.execute(f"DELETE FROM packets WHERE id NOT IN (SELECT id FROM packets ORDER BY id DESC LIMIT {_MAX_PACKETS})")
+        global _packet_inserts_since_prune
+        should_prune = False
+        with _state_lock:
+            _packet_inserts_since_prune += 1
+            if _packet_inserts_since_prune >= _PACKET_PRUNE_EVERY:
+                _packet_inserts_since_prune = 0
+                should_prune = True
+        if should_prune:
+            # Use an ID cutoff instead of NOT IN over the full table, and do it only periodically.
+            row = db.execute(
+                "SELECT id FROM packets ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (_MAX_PACKETS - 1,),
+            ).fetchone()
+            if row:
+                db.execute("DELETE FROM packets WHERE id < ?", (row[0],))
         db.commit()
-        db.close()
         return pid
-    except Exception as e:
-        print(f"[bridge] Packet DB insert error: {e}", file=sys.stderr)
-        return None
+    return _db_call("Packet DB insert", None, _action)
 
 
 async def _db_insert_packet_async(sender: str, sender_key: str, text: str, ch: str,
@@ -369,15 +388,12 @@ async def _db_insert_packet_async(sender: str, sender_key: str, text: str, ch: s
 
 def _db_update_packet_observers(packet_id: int, count: int, obs_list: str):
     """Update observers column for a specific packet row."""
-    try:
-        db = sqlite3.connect(str(_DB_FILE))
+    def _action(db):
         db.execute(
             "UPDATE packets SET observers = ?, observer_list = ? WHERE id = ?",
             (count, obs_list, packet_id))
         db.commit()
-        db.close()
-    except Exception as e:
-        print(f"[bridge] Packet observer update error: {e}", file=sys.stderr)
+    _db_call("Packet observer update", None, _action)
 
 
 async def _db_update_packet_observers_async(packet_id: int, count: int, obs_list: str):
@@ -386,13 +402,11 @@ async def _db_update_packet_observers_async(packet_id: int, count: int, obs_list
 
 def _db_get_packets(limit: int = 100) -> list[dict]:
     """Get recent packets with observer data."""
-    try:
-        db = sqlite3.connect(str(_DB_FILE))
+    def _action(db):
         db.row_factory = sqlite3.Row
         rows = db.execute(
             "SELECT id, ts, sender, sender_key, text, ch, path, path_hops, snr, rssi, observers, observer_list, raw_payload "
             "FROM packets ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-        db.close()
         result = []
         seen = set()
         for r in rows:
@@ -408,9 +422,7 @@ def _db_get_packets(limit: int = 100) -> list[dict]:
             seen.add(dedup_key)
             result.append(d)
         return result
-    except Exception as e:
-        print(f"[bridge] Packet DB query error: {e}", file=sys.stderr)
-        return []
+    return _db_call("Packet DB query", [], _action)
 
 
 async def _db_get_packets_async(limit: int = 100) -> list[dict]:
@@ -420,22 +432,23 @@ async def _db_get_packets_async(limit: int = 100) -> list[dict]:
 async def _push_msg(direction: str, channel: str, sender: str, text: str):
     """Push a structured message to the chat history with dedup."""
     # Dedup: skip "in" if same text+channel was just sent as "out"
-    if direction == "in":
-        for i in range(len(_msg_history) - 1, max(len(_msg_history) - 20, -1), -1):
-            m = _msg_history[i]
-            if m["ch"] == channel and m["from"] == sender and m["text"] == text:
-                return  # duplicate (same sender+channel+text) — skip multi-repeater relay
-    entry = {
-        "ts": datetime.now().strftime("%H:%M:%S"),
-        "dir": direction,
-        "ch": channel,
-        "from": sender,
-        "text": text,
-    }
-    _msg_history.append(entry)
-    if len(_msg_history) > MAX_MSG_HISTORY:
-        _msg_history.pop(0)
-    _save_msg_file()
+    with _state_lock:
+        if direction == "in":
+            for i in range(len(_msg_history) - 1, max(len(_msg_history) - 20, -1), -1):
+                m = _msg_history[i]
+                if m["ch"] == channel and m["from"] == sender and m["text"] == text:
+                    return  # duplicate (same sender+channel+text) — skip multi-repeater relay
+        entry = {
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "dir": direction,
+            "ch": channel,
+            "from": sender,
+            "text": text,
+        }
+        _msg_history.append(entry)
+        if len(_msg_history) > MAX_MSG_HISTORY:
+            _msg_history.pop(0)
+    await _save_msg_file()
     await _db_insert_async(direction, channel, sender, text)
 
 
@@ -541,16 +554,17 @@ async def send_tg(text: str, chat_id: str = None) -> bool:
     now = time.time()
     DEDUP_WINDOW = 300  # 5 minutes
 
-    # Clean expired entries
-    stale = [k for k, t in list(_outbound_msgs.items()) if now - t > DEDUP_WINDOW]
-    for k in stale:
-        del _outbound_msgs[k]
-    if len(_outbound_msgs) > 500:
-        _outbound_msgs.clear()
+    with _state_lock:
+        # Clean expired entries before checking the dedup window.
+        stale = [k for k, t in list(_outbound_msgs.items()) if now - t > DEDUP_WINDOW]
+        for k in stale:
+            del _outbound_msgs[k]
+        if len(_outbound_msgs) > 500:
+            _outbound_msgs.clear()
 
-    if msg_hash in _outbound_msgs:
-        return True  # duplicate within window, silently skip
-    _outbound_msgs[msg_hash] = now
+        if msg_hash in _outbound_msgs:
+            return True  # duplicate within window, silently skip
+        _outbound_msgs[msg_hash] = now
 
     r = await tg_api("sendMessage", {
         "chat_id": chat_id, "text": text,
@@ -592,9 +606,10 @@ def _build_ack_fingerprint(ch, sender_key, ts, text: str) -> str:
 
 def _register_ack_target(packet_id: int, ch, sender_key, ts, text: str, response_payload: dict | None = None):
     """Register all known ACK lookup keys for an outbound packet."""
-    for k in _extract_mesh_ids(response_payload):
-        _packet_ack_targets[k] = packet_id
-    _packet_ack_targets[_build_ack_fingerprint(ch, sender_key, ts, text)] = packet_id
+    with _state_lock:
+        for k in _extract_mesh_ids(response_payload):
+            _packet_ack_targets[k] = packet_id
+        _packet_ack_targets[_build_ack_fingerprint(ch, sender_key, ts, text)] = packet_id
 
 
 def _ack_lookup_keys(payload: dict) -> list[str]:
@@ -630,30 +645,33 @@ async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_s
         now = time.monotonic()
         fp = _packet_fingerprint(sender, sender_key, text, ch, sender_timestamp, path_str)
         dedup_window_s = 180
-        stale_keys = [k for k, t in list(_packet_recent_keys.items()) if now - t > dedup_window_s]
-        for k in stale_keys:
-            del _packet_recent_keys[k]
-        if fp in _packet_recent_keys:
-            return None
-        _packet_recent_keys[fp] = now
+        with _state_lock:
+            stale_keys = [k for k, t in list(_packet_recent_keys.items()) if now - t > dedup_window_s]
+            for k in stale_keys:
+                del _packet_recent_keys[k]
+            if fp in _packet_recent_keys:
+                return None
+            _packet_recent_keys[fp] = now
 
         payload = json.dumps({"sender": sender, "ch": ch, "snr": snr, "rssi": rssi, "path": path_str})
         pid = await _db_insert_packet_async(sender, sender_key, text, ch, path_str, path_hops, snr, rssi, payload)
         # Track ACK observers only for outbound packets.
         if pid and sender in ("JA", "TG"):
-            _packet_observers[pid] = set()
+            with _state_lock:
+                _packet_observers[pid] = set()
         # Cleanup old packet observer entries/mappings
-        if len(_packet_observers) > 200:
-            stale_ids = set(list(_packet_observers.keys())[:100])
-            for packet_id in stale_ids:
-                del _packet_observers[packet_id]
-            if stale_ids:
-                for k, v in list(_packet_ack_targets.items()):
-                    if v in stale_ids:
-                        del _packet_ack_targets[k]
-        if len(_packet_ack_targets) > 500:
-            for k in list(_packet_ack_targets.keys())[:250]:
-                del _packet_ack_targets[k]
+        with _state_lock:
+            if len(_packet_observers) > 200:
+                stale_ids = set(list(_packet_observers.keys())[:100])
+                for packet_id in stale_ids:
+                    del _packet_observers[packet_id]
+                if stale_ids:
+                    for k, v in list(_packet_ack_targets.items()):
+                        if v in stale_ids:
+                            del _packet_ack_targets[k]
+            if len(_packet_ack_targets) > 500:
+                for k in list(_packet_ack_targets.keys())[:250]:
+                    del _packet_ack_targets[k]
         return pid
     except Exception as e:
         print(f"[bridge] Packet track error: {e}", file=sys.stderr)
@@ -735,24 +753,30 @@ async def on_ack(mc, event):
         key = p.get("from", "")[:8]
         text = p.get("text", "")
         if text and key:
-            if text not in _msg_acks:
-                _msg_acks[text] = set()
-            _msg_acks[text].add(key)
+            with _state_lock:
+                if text not in _msg_acks:
+                    _msg_acks[text] = set()
+                _msg_acks[text].add(key)
             _log(f"ACK od {key}: {text[:40]}")
             # Update packet observer set by packet_id via id/fingerprint correlation.
             packet_id = None
-            for k in _ack_lookup_keys(p):
-                if k in _packet_ack_targets:
-                    packet_id = _packet_ack_targets[k]
-                    break
-            if packet_id and packet_id in _packet_observers:
-                _packet_observers[packet_id].add(key)
-                observers = _packet_observers[packet_id]
+            with _state_lock:
+                for k in _ack_lookup_keys(p):
+                    if k in _packet_ack_targets:
+                        packet_id = _packet_ack_targets[k]
+                        break
+                if packet_id and packet_id in _packet_observers:
+                    _packet_observers[packet_id].add(key)
+                    observers = _packet_observers[packet_id]
+                else:
+                    observers = None
+            if packet_id and observers is not None:
                 await _db_update_packet_observers_async(packet_id, len(observers), ",".join(sorted(observers)))
     # Cleanup old entries
-    if len(_msg_acks) > 100:
-        for k in list(_msg_acks.keys())[:50]:
-            del _msg_acks[k]
+    with _state_lock:
+        if len(_msg_acks) > 100:
+            for k in list(_msg_acks.keys())[:50]:
+                del _msg_acks[k]
 
 
 async def on_self_info(mc, event):
@@ -776,34 +800,41 @@ async def on_advert(mc, event):
     if isinstance(p, dict) and p.get("public_key"):
         prefix = p["public_key"][:12]
         ts = datetime.now().strftime("%H:%M")
-        if prefix not in _seen_nodes:
-            _seen_nodes[prefix] = {"ts": ts, "lat": p.get("adv_lat"), "lon": p.get("adv_lon")}
+        with _state_lock:
+            if prefix not in _seen_nodes:
+                _seen_nodes[prefix] = {"ts": ts, "lat": p.get("adv_lat"), "lon": p.get("adv_lon")}
+                new_node = True
+                if len(_seen_nodes) > _MAX_NODES:
+                    for k in list(_seen_nodes.keys())[:_MAX_NODES // 3]:
+                        del _seen_nodes[k]
+            else:
+                _seen_nodes[prefix]["ts"] = ts
+                if p.get("adv_lat") is not None:
+                    _seen_nodes[prefix]["lat"] = p.get("adv_lat")
+                if p.get("adv_lon") is not None:
+                    _seen_nodes[prefix]["lon"] = p.get("adv_lon")
+                new_node = False
+        if new_node:
             _log(f"Nowy node: {prefix[:8]}")
-            if len(_seen_nodes) > _MAX_NODES:
-                for k in list(_seen_nodes.keys())[:_MAX_NODES // 3]:
-                    del _seen_nodes[k]
-        else:
-            _seen_nodes[prefix]["ts"] = ts
-            if p.get("adv_lat") is not None:
-                _seen_nodes[prefix]["lat"] = p.get("adv_lat")
-            if p.get("adv_lon") is not None:
-                _seen_nodes[prefix]["lon"] = p.get("adv_lon")
 
 
 async def _resolve_name(mc, prefix: str) -> str:
-    if prefix in _contact_cache:
-        return _contact_cache[prefix]
+    with _state_lock:
+        cached = _contact_cache.get(prefix)
+    if cached:
+        return cached
     try:
         c = await mc.get_contact_by_key_prefix(prefix)
         name = (c.get("adv_name", "") or c.get("name", "") or prefix[:8]) if c else prefix[:8]
     except Exception as e:
         log.warning(f"Nie mozna rozpoznac kontaktu {prefix}: {e}")
         name = prefix[:8]
-    _contact_cache[prefix] = name
-    if len(_contact_cache) > _MAX_CONTACTS:
-        # keep newest half
-        for k in list(_contact_cache.keys())[:_MAX_CONTACTS // 2]:
-            del _contact_cache[k]
+    with _state_lock:
+        _contact_cache[prefix] = name
+        if len(_contact_cache) > _MAX_CONTACTS:
+            # keep newest half
+            for k in list(_contact_cache.keys())[:_MAX_CONTACTS // 2]:
+                del _contact_cache[k]
     return name
 
 
@@ -831,12 +862,15 @@ async def handle_tg_cmd(mc, text: str):
                 bat = r.payload.get("level", "?")
         except Exception:
             pass
+        with _state_lock:
+            contacts_count = len(_contact_cache)
+            nodes_count = len(_seen_nodes)
         await send_tg(
             f"📊 <b>Status</b>\n"
             f"Polaczony: {'tak' if mc.is_connected else 'nie'}\n"
             f"Bateria: {bat}%\n"
-            f"Kontakty: {len(_contact_cache)}\n"
-            f"Nody: {len(_seen_nodes)}")
+            f"Kontakty: {contacts_count}\n"
+            f"Nody: {nodes_count}")
         return
     if text == "/contacts":
         try:
@@ -927,7 +961,8 @@ async def handle_tg_cmd(mc, text: str):
             for split_at in range(len(rest) - 1, 0, -1):
                 candidate = " ".join(rest[:split_at])
                 candidate_txt = " ".join(rest[split_at:])
-                candidate_key = next((p for p, n in _contact_cache.items() if n.lower() == candidate.lower()), None)
+                with _state_lock:
+                    candidate_key = next((p for p, n in _contact_cache.items() if n.lower() == candidate.lower()), None)
                 if not candidate_key:
                     try:
                         c = await mc.get_contact_by_name(candidate)
@@ -1765,12 +1800,16 @@ body{background:#0a0e13;color:#c9d3df;font:12px/1.7 'IBM Plex Mono',ui-monospace
 </head>
 <body><pre>""" + '{% for line in log %}<span class="ts">{{ line[:8] }}</span>{{ line[8:] }}\n{% endfor %}</pre></body></html>'
 def build_status(mc) -> dict:
-    node_list = sorted(_seen_nodes.keys())
-    my_lat = _self_info.get("adv_lat")
-    my_lon = _self_info.get("adv_lon")
+    with _state_lock:
+        node_list = sorted(_seen_nodes.keys())
+        my_lat = _self_info.get("adv_lat")
+        my_lon = _self_info.get("adv_lon")
+        contacts_count = len(_contact_cache)
+        nodes_count = len(_seen_nodes)
     nodes_with_dist = []
     for p in node_list:
-        nd = dict(_seen_nodes[p])
+        with _state_lock:
+            nd = dict(_seen_nodes[p])
         if nd.get("lat") is not None and nd.get("lon") is not None and my_lat is not None and my_lon is not None:
             nd["dist"] = _haversine(my_lat, my_lon, nd["lat"], nd["lon"])
         else:
@@ -1778,9 +1817,9 @@ def build_status(mc) -> dict:
         nodes_with_dist.append(nd)
     return {
         "connected": mc and mc.is_connected,
-        "contacts": len(_contact_cache),        # from DM events (cache)
+        "contacts": contacts_count,        # from DM events (cache)
         "device_contacts": _device_contact_count,  # from device CMD_GET_CONTACTS
-        "nodes": len(_seen_nodes),
+        "nodes": nodes_count,
         "node_list": node_list,
         "node_data": {p: d for p, d in zip(node_list, nodes_with_dist)},
     }
@@ -1887,11 +1926,15 @@ async def start_web():
 
     @app.get("/api/log")
     async def api_log():
-        return JSONResponse({"log": list(_log_buffer)})
+        with _state_lock:
+            log_lines = list(_log_buffer)
+        return JSONResponse({"log": log_lines})
 
     @app.get("/log")
     async def log_page():
-        lines = "".join(f'<span class="ts">{esc(l[:8])}</span>{esc(l[8:])}\n' for l in _log_buffer[-100:])
+        with _state_lock:
+            recent = list(_log_buffer)[-100:]
+        lines = "".join(f'<span class="ts">{esc(l[:8])}</span>{esc(l[8:])}\n' for l in recent)
         return HTMLResponse(LOG_HTML.replace("{% for line in log %}", "").replace("{% endfor %}", "")
                            + "<pre>" + lines + "</pre></body></html>")
 
@@ -1999,7 +2042,9 @@ async def start_web():
     async def api_messages(request: Request):
         if not _rate_check(request, RATE_GET_MAX):
             return JSONResponse({"error": "Too many requests"}, status_code=429)
-        return JSONResponse(list(_msg_history))
+        with _state_lock:
+            messages = list(_msg_history)
+        return JSONResponse(messages)
 
     @app.get("/api/messages/search")
     async def api_messages_search(request: Request, q: str = "", ch: str = "",
@@ -2038,7 +2083,9 @@ async def start_web():
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, text, getattr(r, "payload", None))
                 _log(f"-> kanal{ch}: {text[:60]}")
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
-                return JSONResponse({"ok": True, "acks": len(_msg_acks.get(text, set()))})
+                with _state_lock:
+                    ack_count = len(_msg_acks.get(text, set()))
+                return JSONResponse({"ok": True, "acks": ack_count})
             return JSONResponse({"error": r.payload.get("reason", "unknown") if r.payload else "unknown"})
         except Exception as e:
             return JSONResponse({"error": str(e)})
@@ -2562,6 +2609,7 @@ async def main():
             await maybe_stop
         await mc.disconnect()
         await _http.aclose()
+        _log_executor.shutdown(wait=False, cancel_futures=True)
         _log("Bridge zatrzymany")
 
 
