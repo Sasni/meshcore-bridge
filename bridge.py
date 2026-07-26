@@ -1124,23 +1124,29 @@ async def handle_tg_cmd(mc, text: str):
             key = None
             target = ""
             txt = " ".join(rest)
-            for split_at in range(len(rest) - 1, 0, -1):
-                candidate = " ".join(rest[:split_at])
-                candidate_txt = " ".join(rest[split_at:])
-                with _state_lock:
-                    candidate_key = next((p for p, n in _contact_cache.items() if n.lower() == candidate.lower()), None)
-                if not candidate_key:
-                    try:
-                        c = await _mc_call(mc.get_contact_by_name(candidate), timeout=5)
-                        if c:
-                            candidate_key = c.get("public_key", "")[:12]
-                    except Exception as e:
-                        log.warning(f"/r: nie znaleziono kontaktu '{candidate}': {e}")
-                if candidate_key:
-                    target = candidate
-                    key = candidate_key
-                    txt = candidate_txt
-                    break
+            # First pass: check the contact cache for every candidate split.
+            # Cache hits are instant (no device query).
+            candidates = [(split_at, " ".join(rest[:split_at]), " ".join(rest[split_at:]))
+                          for split_at in range(len(rest) - 1, 0, -1)]
+            with _state_lock:
+                for _, candidate, candidate_txt in candidates:
+                    candidate_key = next((p for p, n in _contact_cache.items()
+                                          if n.lower() == candidate.lower()), None)
+                    if candidate_key:
+                        target, key, txt = candidate, candidate_key, candidate_txt
+                        break
+            # Second pass: all cache misses → single device query for the
+            # longest candidate only.  Avoids O(n) blocking radio round-trips.
+            if not key:
+                _, candidate, candidate_txt = candidates[0]
+                try:
+                    c = await _mc_call(mc.get_contact_by_name(candidate), timeout=5)
+                    if c:
+                        candidate_key = c.get("public_key", "")[:12]
+                        if candidate_key:
+                            target, key, txt = candidate, candidate_key, candidate_txt
+                except Exception as e:
+                    log.warning(f"/r: nie znaleziono kontaktu '{candidate}': {e}")
             if not key:
                 await send_tg(f"Nie znaleziono kontaktu: {' '.join(rest[:-1])}")
                 return
