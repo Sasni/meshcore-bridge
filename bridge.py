@@ -654,6 +654,16 @@ async def send_tg_html(html: str, chat_id: str = None) -> bool:
     return bool(ok)
 
 
+def _count_hops(path_str: str) -> int:
+    """Return hop count from a MeshCore hex routing path (12 hex chars per hop)."""
+    if not path_str:
+        return 0
+    path_len = len(path_str)
+    if path_len % 12 != 0:
+        log.warning(f"Sciezka routingu ma nieprawidlowa dlugosc ({path_len} znakow, nie wielokrotnosc 12): {path_str[:60]}")
+    return path_len // 12
+
+
 def _payload_hash(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
@@ -794,7 +804,7 @@ async def on_contact_message(mc, event):
     await _push_msg("in", "DM", sender, text)
     # Track packet
     path_str = p.get("path", "")
-    path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
+    path_hops = _count_hops(path_str)
     rssi = p.get("RSSI", None)
     await _track_packet(sender, pk, text, "DM", path_str, path_hops, snr, rssi, ts)
     await send_tg_html(msg)
@@ -838,7 +848,7 @@ async def on_channel_message(mc, event):
     await _push_msg("in", f"CH{ch}", sender, stripped)
     # Track packet
     path_str = p.get("path", "")
-    path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
+    path_hops = _count_hops(path_str)
     rssi = p.get("RSSI", None)
     ch_snr = p.get("SNR", None)
     ch_label = f"CH{ch}"
