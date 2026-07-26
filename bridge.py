@@ -2496,6 +2496,31 @@ async def main():
     asyncio.create_task(_connection_watchdog())
     _log("Nasluchiwanie...")
 
+    # Cleanup: remove contacts inactive >100 weeks (clock drift considered)
+    async def _clean_old_contacts():
+        try:
+            r = await _mc_call(mc.commands.get_contacts(), timeout=15)
+            if not r or r.type.name == "ERROR":
+                return
+            clist = r.payload.get("contacts", [])
+            now = int(time.time())
+            removed = 0
+            for c in clist:
+                la = c.get("last_advert", 0)
+                if la > 1000000000 and (now - la) / (7*24*3600) > 100:
+                    pk = c.get("public_key", "")
+                    if len(pk) == 64:
+                        try:
+                            await mc.commands.remove_contact(pk)
+                            removed += 1
+                        except Exception:
+                            pass
+            if removed:
+                _log(f"Usunieto {removed} starych kontaktow (>100 tyg)")
+        except Exception:
+            pass
+    asyncio.create_task(_clean_old_contacts())
+
     # Pre-populate device info cache
     global _device_info_ts, _device_contact_count
     try:
