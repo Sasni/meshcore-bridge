@@ -29,7 +29,7 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL),
 log = logging.getLogger("bridge")
 
 # ── Global state ──────────────────────────────────────────────
-_contact_cache: dict[str, str] = {}       # pubkey_prefix → name
+_contact_cache: dict = {}       # pubkey_prefix → name (or _PENDING during resolution)
 _seen_nodes: dict[str, dict] = {}          # prefix → info {"ts": str}
 _MAX_CONTACTS = 500
 _MAX_NODES = 200
@@ -939,17 +939,26 @@ async def on_advert(mc, event):
             _log(f"Nowy node: {prefix[:8]}")
 
 
+_PENDING = object()  # sentinel: contact resolution in progress, prevents duplicate queries
+
 async def _resolve_name(mc, prefix: str) -> str:
     with _state_lock:
         cached = _contact_cache.get(prefix)
-    if cached:
-        return cached
+        if cached is _PENDING:
+            # Another task is already resolving this prefix — return a
+            # temporary name rather than duplicating the expensive device query.
+            return prefix[:8]
+        if cached:
+            return cached
+        _contact_cache[prefix] = _PENDING  # reserve the slot
+
     try:
         c = await mc.get_contact_by_key_prefix(prefix)
         name = (c.get("adv_name", "") or c.get("name", "") or prefix[:8]) if c else prefix[:8]
     except Exception as e:
         log.warning(f"Nie mozna rozpoznac kontaktu {prefix}: {e}")
         name = prefix[:8]
+
     with _state_lock:
         _contact_cache[prefix] = name
         if len(_contact_cache) > _MAX_CONTACTS:
