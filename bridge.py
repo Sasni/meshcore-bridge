@@ -159,6 +159,17 @@ def _safe_json(obj):
 
 import math
 
+def _sanitize_coord(value, lo: float, hi: float) -> float | None:
+    """Return *value* as float if it is within [lo, hi], else None."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if lo <= v <= hi else None
+
+
 def _haversine(lat1, lon1, lat2, lon2):
     """Distance in km between two lat/lon points."""
     R = 6371
@@ -891,7 +902,9 @@ async def on_self_info(mc, event):
     _last_rx_ts = time.time()
     p = event.payload
     if isinstance(p, dict):
-        _self_info = p
+        _self_info = dict(p)
+        _self_info["adv_lat"] = _sanitize_coord(p.get("adv_lat"), -90, 90)
+        _self_info["adv_lon"] = _sanitize_coord(p.get("adv_lon"), -180, 180)
         name = p.get("name", "?")
         try:
             freq = float(p.get("radio_freq", 0))
@@ -914,7 +927,11 @@ async def on_advert(mc, event):
         NODE_MAX_AGE = 14 * 86400  # 14 dni
         with _state_lock:
             if prefix not in _seen_nodes:
-                _seen_nodes[prefix] = {"ts": ts, "seen_at": now, "lat": p.get("adv_lat"), "lon": p.get("adv_lon")}
+                _seen_nodes[prefix] = {
+                    "ts": ts, "seen_at": now,
+                    "lat": _sanitize_coord(p.get("adv_lat"), -90, 90),
+                    "lon": _sanitize_coord(p.get("adv_lon"), -180, 180),
+                }
                 new_node = True
                 # Usuń nody starsze niż 14 dni
                 cutoff = now - NODE_MAX_AGE
@@ -933,10 +950,12 @@ async def on_advert(mc, event):
             else:
                 _seen_nodes[prefix]["ts"] = ts
                 _seen_nodes[prefix]["seen_at"] = now
-                if p.get("adv_lat") is not None:
-                    _seen_nodes[prefix]["lat"] = p.get("adv_lat")
-                if p.get("adv_lon") is not None:
-                    _seen_nodes[prefix]["lon"] = p.get("adv_lon")
+                lat = _sanitize_coord(p.get("adv_lat"), -90, 90)
+                if lat is not None:
+                    _seen_nodes[prefix]["lat"] = lat
+                lon = _sanitize_coord(p.get("adv_lon"), -180, 180)
+                if lon is not None:
+                    _seen_nodes[prefix]["lon"] = lon
                 new_node = False
         if new_node:
             _log(f"Nowy node: {prefix[:8]}")
