@@ -805,24 +805,31 @@ async def on_channel_message(mc, event):
         pk = path[:6] if path else ""
     if not pk:
         sender = "Nieznany"
-        # Try to extract sender from message text prefix (MeshCore convention: "Name: message")
-        if ":" in text and len(text.split(":")[0]) < 20:
-            prefix = text.split(":")[0].strip()
-            if prefix and not prefix.startswith("http") and " " not in prefix:
-                sender = prefix
+        # Some devices prepend "Name: " to channel messages because the
+        # protocol doesn't carry sender metadata.  Strip this prefix from
+        # the displayed text so impersonation attempts ("Admin: ALERT")
+        # aren't echoed verbatim — but NEVER use it as the sender identity.
+        stripped = text
+        if ":" in text:
+            maybe_name = text.split(":")[0].strip()
+            if maybe_name and len(maybe_name) < 20 and " " not in maybe_name and not maybe_name.startswith("http"):
+                stripped = text.split(":", 1)[1].strip()
+                if not stripped:
+                    stripped = text  # don't blank the whole message
     else:
         sender = await _resolve_name(mc, pk)
+        stripped = text
     t = _fmt_ts(ts) or datetime.now().strftime("%d.%m %H:%M")
-    msg = f"📢 <b>Kanal {ch}</b> {t}\n👤 {esc(sender)}\n\n{esc(text)}"
-    _log(f"<- kanal{ch} {sender}: {text[:60]}")
-    await _push_msg("in", f"CH{ch}", sender, text)
+    msg = f"📢 <b>Kanal {ch}</b> {t}\n👤 {esc(sender)}\n\n{esc(stripped)}"
+    _log(f"<- kanal{ch} {sender}: {stripped[:60]}")
+    await _push_msg("in", f"CH{ch}", sender, stripped)
     # Track packet
     path_str = p.get("path", "")
     path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
     rssi = p.get("RSSI", None)
     ch_snr = p.get("SNR", None)
     ch_label = f"CH{ch}"
-    await _track_packet(sender, pk, text, ch_label, path_str, path_hops, ch_snr, rssi, ts)
+    await _track_packet(sender, pk, stripped, ch_label, path_str, path_hops, ch_snr, rssi, ts)
     await send_tg_html(msg)
 
 
