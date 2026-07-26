@@ -1056,6 +1056,9 @@ async def handle_tg_cmd(mc, text: str):
         parts = text.split(maxsplit=1)
         try:
             ch = int(parts[1]) if len(parts) > 1 else 0
+            if not 0 <= ch <= 255:
+                await send_tg("Numer kanalu poza zakresem (0-255)")
+                return
         except ValueError:
             await send_tg("Uzycie: /channel [nr]")
             return
@@ -1089,6 +1092,9 @@ async def handle_tg_cmd(mc, text: str):
         else:
             try:
                 ch = int(parts[1]); txt = parts[2]
+                if not 0 <= ch <= 255:
+                    await send_tg("Numer kanalu poza zakresem (0-255)")
+                    return
             except ValueError:
                 await send_tg("Nieprawidlowy numer kanalu. Uzycie: /ch <tekst> lub /ch <nr> <tekst>")
                 return
