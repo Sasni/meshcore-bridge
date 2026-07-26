@@ -1822,11 +1822,11 @@ window._cd.forEach(c=>{
   const rel=_relTime(c.last_advert);
   const fresh=c.last_advert&&(Date.now()/1000-c.last_advert<3600);
   const stale=c.last_advert&&(Date.now()/1000-c.last_advert>86400*7);
-  h+='<tr><td>'+esc(c.name)+'</td><td>'+dst+'</td><td style="color:'+(fresh?'var(--good)':stale?'var(--text-faint)':'var(--text-dim)')+'">'+rel+'</td><td style="text-align:right"><button class="btn btn-sm" onclick="showContact(\''+c.key+'\')">Szczegóły</button></td></tr>';
+  h+='<tr><td>'+esc(c.name)+'</td><td>'+dst+'</td><td style="color:'+(fresh?'var(--good)':stale?'var(--text-faint)':'var(--text-dim)')+'">'+rel+'</td><td style="text-align:right"><button class="btn btn-sm" data-key="'+esc(c.key)+'" onclick="showContact(this.dataset.key)">Szczegóły</button></td></tr>';
 });
 t.innerHTML=h;}
 const CONTACT_TYPES={0:'NONE',1:'Klient',2:'Repeater',3:'Room',4:'Sensor'};
-function showContact(key){const c=window._cd.find(x=>x.key===key);if(!c)return;
+function showContact(k){const c=window._cd.find(x=>x.key===k);if(!c)return;
 document.getElementById('cd-name').textContent=c.name;
 document.getElementById('cd-key').textContent=c.public_key||c.key||'?';
 document.getElementById('cd-type').textContent=c.type!=null?(CONTACT_TYPES[c.type]||'Type '+c.type):'-';
