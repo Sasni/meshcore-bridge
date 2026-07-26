@@ -987,7 +987,7 @@ async def _resolve_name(mc, prefix: str) -> str:
         _contact_cache[prefix] = _PENDING  # reserve the slot
 
     try:
-        c = await mc.get_contact_by_key_prefix(prefix)
+        c = await _mc_call(mc.get_contact_by_key_prefix(prefix), timeout=5)
         name = (c.get("adv_name", "") or c.get("name", "") or prefix[:8]) if c else prefix[:8]
     except Exception as e:
         log.warning(f"Nie mozna rozpoznac kontaktu {prefix}: {e}")
@@ -1131,7 +1131,7 @@ async def handle_tg_cmd(mc, text: str):
                     candidate_key = next((p for p, n in _contact_cache.items() if n.lower() == candidate.lower()), None)
                 if not candidate_key:
                     try:
-                        c = await mc.get_contact_by_name(candidate)
+                        c = await _mc_call(mc.get_contact_by_name(candidate), timeout=5)
                         if c:
                             candidate_key = c.get("public_key", "")[:12]
                     except Exception as e:
@@ -2724,7 +2724,7 @@ async def main():
                     pk = c.get("public_key", "")
                     if len(pk) == 64:
                         try:
-                            await mc.commands.remove_contact(pk)
+                            await _mc_call(mc.commands.remove_contact(pk), timeout=5)
                             removed += 1
                         except Exception:
                             pass
