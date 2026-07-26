@@ -720,7 +720,7 @@ def _packet_fingerprint(sender: str, sender_key: str, text: str, ch: str, sender
 
 # ── MeshCore handlers ────────────────────────────────────────
 
-async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_str: str, path_hops: int, snr, rssi, sender_timestamp=None):
+async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_str: str, path_hops: int, snr, rssi, sender_timestamp=None, *, is_outbound: bool = False):
     """Record packet metadata to SQLite."""
     try:
         now = time.monotonic()
@@ -737,7 +737,7 @@ async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_s
         payload = json.dumps({"sender": sender, "ch": ch, "snr": snr, "rssi": rssi, "path": path_str})
         pid = await _db_insert_packet_async(sender, sender_key, text, ch, path_str, path_hops, snr, rssi, payload)
         # Track ACK observers only for outbound packets.
-        if pid and sender in ("JA", "TG"):
+        if pid and is_outbound:
             with _state_lock:
                 _packet_observers[pid] = set()
         # Cleanup old packet observer entries/mappings
@@ -1022,7 +1022,7 @@ async def handle_tg_cmd(mc, text: str):
             else:
                 _log(f"-> kanal{ch}: {txt[:60]}")
                 await _push_msg("out", f"CH{ch}", "TG", txt)
-                pid = await _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None, send_ts)
+                pid = await _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None, send_ts, is_outbound=True)
                 if pid:
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, txt, getattr(r, "payload", None))
                 await send_tg_html(f"📤 <b>Kanal {ch}</b>\n{esc(txt)}")
@@ -1079,7 +1079,7 @@ async def handle_tg_cmd(mc, text: str):
             else:
                 _log(f"-> do {target}: {txt[:60]}")
                 await _push_msg("out", "DM", target, txt)
-                pid = await _track_packet("TG", key, txt, "DM", "", 0, None, None, send_ts)
+                pid = await _track_packet("TG", key, txt, "DM", "", 0, None, None, send_ts, is_outbound=True)
                 if pid:
                     _register_ack_target(pid, "DM", key, send_ts, txt, getattr(r, "payload", None))
                 await send_tg_html(f"📤 <b>Do {esc(target)}</b>\n{esc(txt)}")
@@ -2165,7 +2165,7 @@ async def start_web():
             r = await _mc_call(_mc_ref.commands.send_chan_msg(ch, text), timeout=5)
             if r.type.name != "ERROR":
                 await _push_msg("out", f"CH{ch}", "JA", text)
-                pid = await _track_packet("JA", "", text, f"CH{ch}", "", 0, None, None, send_ts)
+                pid = await _track_packet("JA", "", text, f"CH{ch}", "", 0, None, None, send_ts, is_outbound=True)
                 if pid:
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, text, getattr(r, "payload", None))
                 _log(f"-> kanal{ch}: {text[:60]}")
