@@ -1185,7 +1185,10 @@ async def tg_poll_loop(mc):
             chat_id = str(tg.get("chat_id", ""))
             allowed = tg.get("allowed_users", [])
             if not allowed:
-                allowed = [int(chat_id)] if chat_id else []
+                # Private chat: default to owner-only.  Group (negative ID):
+                # empty allowed list means "allow all group members".
+                if chat_id and not chat_id.startswith("-"):
+                    allowed = [int(chat_id)]
             if not chat_id:
                 await asyncio.sleep(5); continue
             r = await tg_api("getUpdates", {
@@ -1197,7 +1200,7 @@ async def tg_poll_loop(mc):
                     msg = upd.get("message", {})
                     if str(msg.get("chat", {}).get("id", "")) == chat_id:
                         uid = msg.get("from", {}).get("id")
-                        if uid not in allowed:
+                        if allowed and uid not in allowed:
                             _log(f"TG odrzucone od uid={uid}: {msg.get('text','')[:40]}")
                             continue
                         text = msg.get("text", "").strip()
