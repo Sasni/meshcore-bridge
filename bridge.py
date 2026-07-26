@@ -1009,14 +1009,14 @@ async def handle_tg_cmd(mc, text: str):
     if text.startswith("/help") or text == "/start":
         await send_tg_html(
             "🤖 <b>MeshCore Bridge</b>\n\n"
-            "/r &lt;tekst&gt; \u2014 odpowiedz ostatniemu\n"
-            "/r &lt;nazwa&gt; &lt;tekst&gt; \u2014 do kontaktu\n"
-            "/ch &lt;tekst&gt; — wyslij na kanal 0\n"
-            "/ch &lt;nr&gt; &lt;tekst&gt; — na konkretny kanal\n"
-            "/channel — to samo co /ch\n"
-            "/contacts \u2014 kontakty + nody\n"
-            "/status \u2014 status\n"
-            "/help \u2014 pomoc")
+            "/r &lt;tekst&gt; \u2014 odpowiedz ostatniemu nadawcy\n"
+            "/r &lt;nazwa&gt; &lt;tekst&gt; \u2014 DM do kontaktu\n"
+            "/ch &lt;tekst&gt; \u2014 wyślij na kanał 0\n"
+            "/ch &lt;nr&gt; &lt;tekst&gt; \u2014 wyślij na kanał nr (0–255)\n"
+            "/channel &lt;nr&gt; \u2014 info o kanale (domyślnie 0)\n"
+            "/contacts \u2014 lista kontaktów i nodów\n"
+            "/status \u2014 stan mostka i bateria\n"
+            "/help \u2014 ta pomoc")
         return
     if text == "/status":
         bat = "?"
