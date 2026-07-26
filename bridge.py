@@ -702,7 +702,7 @@ def _ack_lookup_keys(payload: dict) -> list[str]:
     return keys
 
 
-def _packet_fingerprint(sender: str, sender_key: str, text: str, ch: str, sender_timestamp=None, path_str: str = "") -> str:
+def _packet_fingerprint(sender: str, sender_key: str, text: str, ch: str, sender_timestamp=None) -> str:
     """Build a stable fingerprint for packet deduplication."""
     ts_part = ""
     try:
@@ -711,7 +711,11 @@ def _packet_fingerprint(sender: str, sender_key: str, text: str, ch: str, sender
     except Exception:
         ts_part = ""
     if not ts_part:
-        ts_part = _payload_hash(path_str)
+        # No sender timestamp — fall back to the local epoch second so
+        # that two packets traversing the same route at different times
+        # cannot collide.  _payload_hash(path_str) was NOT a valid
+        # substitute because path alone carries no temporal information.
+        ts_part = str(int(time.time()))
     return f"{sender}|{sender_key}|{ch}|{ts_part}|{_payload_hash(text)}"
 
 
@@ -721,7 +725,7 @@ async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_s
     """Record packet metadata to SQLite."""
     try:
         now = time.monotonic()
-        fp = _packet_fingerprint(sender, sender_key, text, ch, sender_timestamp, path_str)
+        fp = _packet_fingerprint(sender, sender_key, text, ch, sender_timestamp)
         dedup_window_s = 180
         with _state_lock:
             stale_keys = [k for k, t in list(_packet_recent_keys.items()) if now - t > dedup_window_s]
