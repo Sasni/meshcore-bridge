@@ -545,34 +545,67 @@ async def tg_api(method: str, payload: dict = None) -> dict | None:
         return None
 
 
-async def send_tg(text: str, chat_id: str = None) -> bool:
-    if chat_id is None:
-        chat_id = load_config().get("telegram", {}).get("chat_id", "")
-    if not chat_id:
-        return False
+def _check_tg_dedup(text: str) -> bool:
+    """Return True if *text* is a duplicate within the dedup window (should skip)."""
     msg_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
     now = time.time()
     DEDUP_WINDOW = 300  # 5 minutes
-
     with _state_lock:
-        # Clean expired entries before checking the dedup window.
         stale = [k for k, t in list(_outbound_msgs.items()) if now - t > DEDUP_WINDOW]
         for k in stale:
             del _outbound_msgs[k]
         if len(_outbound_msgs) > 500:
             _outbound_msgs.clear()
-
         if msg_hash in _outbound_msgs:
-            return True  # duplicate within window, silently skip
+            return True
         _outbound_msgs[msg_hash] = now
+    return False
 
+
+async def send_tg(text: str, chat_id: str = None) -> bool:
+    """Send a plain-text message to Telegram.
+
+    HTML metacharacters (<, >, &) are automatically escaped so that mesh
+    messages containing those characters are never silently rejected by
+    the Telegram API.  Callers that need formatting must use send_tg_html().
+    """
+    if chat_id is None:
+        chat_id = load_config().get("telegram", {}).get("chat_id", "")
+    if not chat_id:
+        return False
+    if _check_tg_dedup(text):
+        return True
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     r = await tg_api("sendMessage", {
-        "chat_id": chat_id, "text": text,
-        "parse_mode": "HTML", "disable_web_page_preview": True,
+        "chat_id": chat_id, "text": safe,
+        "disable_web_page_preview": True,
     })
     ok = r and r.get("ok")
     if not ok:
         log.warning(f"TG send fail: {r}")
+    return bool(ok)
+
+
+async def send_tg_html(html: str, chat_id: str = None) -> bool:
+    """Send a pre-escaped HTML message to Telegram.
+
+    The caller MUST escape every piece of untrusted content with esc()
+    BEFORE interpolating it into the HTML string.  This function sends
+    with ``parse_mode=HTML`` and trusts the caller.
+    """
+    if chat_id is None:
+        chat_id = load_config().get("telegram", {}).get("chat_id", "")
+    if not chat_id:
+        return False
+    if _check_tg_dedup(html):
+        return True
+    r = await tg_api("sendMessage", {
+        "chat_id": chat_id, "text": html,
+        "parse_mode": "HTML", "disable_web_page_preview": True,
+    })
+    ok = r and r.get("ok")
+    if not ok:
+        log.warning(f"TG HTML send fail: {r}")
     return bool(ok)
 
 
@@ -702,7 +735,7 @@ async def on_contact_message(mc, event):
     path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
     rssi = p.get("RSSI", None)
     await _track_packet(sender, pk, text, "DM", path_str, path_hops, snr, rssi, ts)
-    await send_tg(msg)
+    await send_tg_html(msg)
 
 
 async def on_channel_message(mc, event):
@@ -741,7 +774,7 @@ async def on_channel_message(mc, event):
     ch_snr = p.get("SNR", None)
     ch_label = f"CH{ch}"
     await _track_packet(sender, pk, text, ch_label, path_str, path_hops, ch_snr, rssi, ts)
-    await send_tg(msg)
+    await send_tg_html(msg)
 
 
 async def on_ack(mc, event):
@@ -790,7 +823,7 @@ async def on_self_info(mc, event):
         sf = p.get("radio_sf", "?")
         s = f" {freq:.1f}MHz SF{sf}" if freq else ""
         _log(f"Polaczono z: {name}{s}")
-        await send_tg(f"🟢 <b>MeshCore Bridge</b>\n📟 {name}{s}")
+        await send_tg_html(f"🟢 <b>MeshCore Bridge</b>\n📟 {name}{s}")
 
 
 async def on_advert(mc, event):
@@ -852,7 +885,7 @@ async def _resolve_name(mc, prefix: str) -> str:
 async def handle_tg_cmd(mc, text: str):
     text = text.strip()
     if text.startswith("/help") or text == "/start":
-        await send_tg(
+        await send_tg_html(
             "🤖 <b>MeshCore Bridge</b>\n\n"
             "/r &lt;tekst&gt; \u2014 odpowiedz ostatniemu\n"
             "/r &lt;nazwa&gt; &lt;tekst&gt; \u2014 do kontaktu\n"
@@ -874,7 +907,7 @@ async def handle_tg_cmd(mc, text: str):
         with _state_lock:
             contacts_count = len(_contact_cache)
             nodes_count = len(_seen_nodes)
-        await send_tg(
+        await send_tg_html(
             f"📊 <b>Status</b>\n"
             f"Polaczony: {'tak' if mc.is_connected else 'nie'}\n"
             f"Bateria: {bat}%\n"
@@ -893,7 +926,7 @@ async def handle_tg_cmd(mc, text: str):
                 lines.append(f"\n<b>Nody ({len(_seen_nodes)})</b>")
                 for pfx in sorted(_seen_nodes)[:20]:
                     lines.append(f"  \u2022 {pfx[:8]}")
-            await send_tg("\n".join(lines))
+            await send_tg_html("\n".join(lines))
         except Exception as e:
             await send_tg(f"Blad: {e}")
         return
@@ -913,7 +946,7 @@ async def handle_tg_cmd(mc, text: str):
             name = c.get("name", "") or c.get("channel_name", "") or "?"
             secret = c.get("secret", "") or c.get("channel_secret", "")
             secret_state = "publiczny" if secret and set(str(secret)) <= {"0"} else "ustawiony"
-            await send_tg(
+            await send_tg_html(
                 f"📶 <b>Kanal {ch}</b>\n"
                 f"Nazwa: {esc(name)}\n"
                 f"Sekret: {esc(secret_state)}\n"
@@ -947,7 +980,7 @@ async def handle_tg_cmd(mc, text: str):
                 pid = await _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None, send_ts)
                 if pid:
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, txt, getattr(r, "payload", None))
-                await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(txt)}")
+                await send_tg_html(f"📤 <b>Kanal {ch}</b>\n{esc(txt)}")
         except Exception as e:
             await send_tg(f"Blad: {e}")
         return
@@ -1004,7 +1037,7 @@ async def handle_tg_cmd(mc, text: str):
                 pid = await _track_packet("TG", key, txt, "DM", "", 0, None, None, send_ts)
                 if pid:
                     _register_ack_target(pid, "DM", key, send_ts, txt, getattr(r, "payload", None))
-                await send_tg(f"📤 <b>Do {esc(target)}</b>\n{esc(txt)}")
+                await send_tg_html(f"📤 <b>Do {esc(target)}</b>\n{esc(txt)}")
         except Exception as e:
             await send_tg(f"Blad: {e}")
         return
@@ -2091,7 +2124,7 @@ async def start_web():
                 if pid:
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, text, getattr(r, "payload", None))
                 _log(f"-> kanal{ch}: {text[:60]}")
-                await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
+                await send_tg_html(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
                 with _state_lock:
                     ack_count = len(_msg_acks.get(text, set()))
                 return JSONResponse({"ok": True, "acks": ack_count})
