@@ -948,6 +948,8 @@ async def on_advert(mc, event):
                     for k, _ in sorted_nodes[:_MAX_NODES // 3]:
                         del _seen_nodes[k]
             else:
+                old_lat = _seen_nodes[prefix].get("lat")
+                old_lon = _seen_nodes[prefix].get("lon")
                 _seen_nodes[prefix]["ts"] = ts
                 _seen_nodes[prefix]["seen_at"] = now
                 lat = _sanitize_coord(p.get("adv_lat"), -90, 90)
@@ -957,6 +959,16 @@ async def on_advert(mc, event):
                 if lon is not None:
                     _seen_nodes[prefix]["lon"] = lon
                 new_node = False
+                # Log when a known node moves significantly (~50 m threshold
+                # to avoid spam from GPS jitter on stationary nodes).
+                lat_changed = (lat is not None and old_lat is not None
+                               and abs(old_lat - lat) > 0.0005)
+                lon_changed = (lon is not None and old_lon is not None
+                               and abs(old_lon - lon) > 0.0005)
+                coords_appeared = (lat is not None or lon is not None) and (old_lat is None and old_lon is None)
+                if lat_changed or lon_changed or coords_appeared:
+                    _log(f"Node {prefix[:8]} zmienil pozycje: "
+                         f"{old_lat or '?'},{old_lon or '?'} → {lat or '?'},{lon or '?'}")
         if new_node:
             _log(f"Nowy node: {prefix[:8]}")
 
