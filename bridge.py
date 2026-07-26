@@ -541,6 +541,10 @@ async def tg_api(method: str, payload: dict = None) -> dict | None:
             return None
     except Exception as e:
         err = str(e).strip() or e.__class__.__name__
+        # httpx often includes the full request URL (with bot token) in
+        # network exception messages — redact it before writing to logs.
+        if token:
+            err = err.replace(token, "***")
         _log_warn_throttled(f"tg_api_exc_{method}", f"TG {method}: {err}", every_s=60)
         return None
 
