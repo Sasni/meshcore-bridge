@@ -669,7 +669,7 @@ def _extract_mesh_ids(payload: dict | None) -> list[str]:
     out = []
     for k in keys:
         v = payload.get(k)
-        if v is not None and v != "":
+        if isinstance(v, (str, int)) and v != "":
             out.append(f"id:{k}:{v}")
     return out
 
