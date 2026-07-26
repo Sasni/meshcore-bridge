@@ -550,7 +550,13 @@ async def tg_api(method: str, payload: dict = None) -> dict | None:
 
 
 def _check_tg_dedup(text: str, chat_id: str) -> bool:
-    """Return True if *text* is a duplicate for the given *chat_id* within the dedup window."""
+    """Return True if *text* was already sent to *chat_id* within the dedup window.
+
+    When False, the text+chat_id pair is atomically registered so the next
+    call within the window is seen as a duplicate.  Callers should treat
+    *both* return values as \"message is in Telegram\" — the distinction
+    only matters internally to avoid re-sending within 5 min.
+    """
     msg_hash = hashlib.sha256(f"{chat_id}:{text}".encode()).hexdigest()[:16]
     now = time.time()
     DEDUP_WINDOW = 300  # 5 minutes
@@ -572,13 +578,17 @@ async def send_tg(text: str, chat_id: str = None) -> bool:
     HTML metacharacters (<, >, &) are automatically escaped so that mesh
     messages containing those characters are never silently rejected by
     the Telegram API.  Callers that need formatting must use send_tg_html().
+
+    Returns True when the message is known to be in Telegram — either sent
+    by this call, or already sent within the 5-minute dedup window.
+    Returns False only when no chat_id is configured or the API call failed.
     """
     if chat_id is None:
         chat_id = load_config().get("telegram", {}).get("chat_id", "")
     if not chat_id:
         return False
     if _check_tg_dedup(text, chat_id):
-        return True
+        return True   # already sent within dedup window — still a success
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     r = await tg_api("sendMessage", {
         "chat_id": chat_id, "text": safe,
@@ -596,13 +606,17 @@ async def send_tg_html(html: str, chat_id: str = None) -> bool:
     The caller MUST escape every piece of untrusted content with esc()
     BEFORE interpolating it into the HTML string.  This function sends
     with ``parse_mode=HTML`` and trusts the caller.
+
+    Returns True when the message is known to be in Telegram — either sent
+    by this call, or already sent within the 5-minute dedup window.
+    Returns False only when no chat_id is configured or the API call failed.
     """
     if chat_id is None:
         chat_id = load_config().get("telegram", {}).get("chat_id", "")
     if not chat_id:
         return False
     if _check_tg_dedup(html, chat_id):
-        return True
+        return True   # already sent within dedup window — still a success
     r = await tg_api("sendMessage", {
         "chat_id": chat_id, "text": html,
         "parse_mode": "HTML", "disable_web_page_preview": True,
