@@ -736,23 +736,22 @@ async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_s
 
         payload = json.dumps({"sender": sender, "ch": ch, "snr": snr, "rssi": rssi, "path": path_str})
         pid = await _db_insert_packet_async(sender, sender_key, text, ch, path_str, path_hops, snr, rssi, payload)
-        # Track ACK observers only for outbound packets.
-        if pid and is_outbound:
+        # Observer setup + cleanup in one critical section (no await between them).
+        if pid:
             with _state_lock:
-                _packet_observers[pid] = set()
-        # Cleanup old packet observer entries/mappings
-        with _state_lock:
-            if len(_packet_observers) > 200:
-                stale_ids = set(list(_packet_observers.keys())[:100])
-                for packet_id in stale_ids:
-                    del _packet_observers[packet_id]
-                if stale_ids:
-                    for k, v in list(_packet_ack_targets.items()):
-                        if v in stale_ids:
-                            del _packet_ack_targets[k]
-            if len(_packet_ack_targets) > 500:
-                for k in list(_packet_ack_targets.keys())[:250]:
-                    del _packet_ack_targets[k]
+                if is_outbound:
+                    _packet_observers.setdefault(pid, set())
+                if len(_packet_observers) > 200:
+                    stale_ids = set(list(_packet_observers.keys())[:100])
+                    for packet_id in stale_ids:
+                        del _packet_observers[packet_id]
+                    if stale_ids:
+                        for k, v in list(_packet_ack_targets.items()):
+                            if v in stale_ids:
+                                del _packet_ack_targets[k]
+                if len(_packet_ack_targets) > 500:
+                    for k in list(_packet_ack_targets.keys())[:250]:
+                        del _packet_ack_targets[k]
         return pid
     except Exception as e:
         print(f"[bridge] Packet track error: {e}", file=sys.stderr)
@@ -849,7 +848,10 @@ async def on_ack(mc, event):
                     if k in _packet_ack_targets:
                         packet_id = _packet_ack_targets[k]
                         break
-                if packet_id and packet_id in _packet_observers:
+                if packet_id:
+                    # Create observer set if _track_packet hasn't finished yet
+                    # (covers the race window between DB insert and observer setup).
+                    _packet_observers.setdefault(packet_id, set())
                     _packet_observers[packet_id].add(key)
                     observers = _packet_observers[packet_id]
                 else:
