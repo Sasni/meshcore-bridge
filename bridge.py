@@ -519,34 +519,58 @@ async def tg_api(method: str, payload: dict = None) -> dict | None:
     if not token:
         return None
     url = f"https://api.telegram.org/bot{token}/{method}"
-    try:
-        r = await _http.post(url, json=payload or {}, timeout=30)
-        if r.status_code != 200:
-            body = (r.text or "").replace("\n", " ").strip()[:240]
-            _log_warn_throttled(
-                f"tg_api_status_{method}_{r.status_code}",
-                f"TG {method}: HTTP {r.status_code}" + (f" body={body}" if body else ""),
-                every_s=60,
-            )
-            return None
+    MAX_TRIES = 3
+    for attempt in range(MAX_TRIES):
         try:
-            return r.json()
+            r = await _http.post(url, json=payload or {}, timeout=30)
+            if r.status_code == 429:
+                retry_after = 5  # Telegram default when field is missing
+                try:
+                    body = r.json()
+                    retry_after = int(body.get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    pass
+                if attempt < MAX_TRIES - 1:
+                    _log_warn_throttled(
+                        f"tg_api_429_{method}",
+                        f"TG {method}: rate limited (429), retry in {retry_after}s (attempt {attempt + 1}/{MAX_TRIES})",
+                        every_s=120,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                _log_warn_throttled(
+                    f"tg_api_429_exhausted_{method}",
+                    f"TG {method}: rate limited (429), all {MAX_TRIES} attempts exhausted",
+                    every_s=120,
+                )
+                return None
+            if r.status_code != 200:
+                body = (r.text or "").replace("\n", " ").strip()[:240]
+                _log_warn_throttled(
+                    f"tg_api_status_{method}_{r.status_code}",
+                    f"TG {method}: HTTP {r.status_code}" + (f" body={body}" if body else ""),
+                    every_s=60,
+                )
+                return None
+            try:
+                return r.json()
+            except Exception as e:
+                body = (r.text or "").replace("\n", " ").strip()[:240]
+                _log_warn_throttled(
+                    f"tg_api_json_{method}",
+                    f"TG {method}: niepoprawny JSON ({e.__class__.__name__})" + (f" body={body}" if body else ""),
+                    every_s=60,
+                )
+                return None
         except Exception as e:
-            body = (r.text or "").replace("\n", " ").strip()[:240]
-            _log_warn_throttled(
-                f"tg_api_json_{method}",
-                f"TG {method}: niepoprawny JSON ({e.__class__.__name__})" + (f" body={body}" if body else ""),
-                every_s=60,
-            )
+            err = str(e).strip() or e.__class__.__name__
+            # httpx often includes the full request URL (with bot token) in
+            # network exception messages — redact it before writing to logs.
+            if token:
+                err = err.replace(token, "***")
+            _log_warn_throttled(f"tg_api_exc_{method}", f"TG {method}: {err}", every_s=60)
             return None
-    except Exception as e:
-        err = str(e).strip() or e.__class__.__name__
-        # httpx often includes the full request URL (with bot token) in
-        # network exception messages — redact it before writing to logs.
-        if token:
-            err = err.replace(token, "***")
-        _log_warn_throttled(f"tg_api_exc_{method}", f"TG {method}: {err}", every_s=60)
-        return None
+    return None
 
 
 def _check_tg_dedup(text: str, chat_id: str) -> bool:
