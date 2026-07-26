@@ -893,7 +893,10 @@ async def on_self_info(mc, event):
     if isinstance(p, dict):
         _self_info = p
         name = p.get("name", "?")
-        freq = p.get("radio_freq", 0)
+        try:
+            freq = float(p.get("radio_freq", 0))
+        except (TypeError, ValueError):
+            freq = 0.0
         sf = p.get("radio_sf", "?")
         s = f" {freq:.1f}MHz SF{sf}" if freq else ""
         _log(f"Polaczono z: {name}{s}")
