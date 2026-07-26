@@ -589,7 +589,10 @@ def _check_tg_dedup(text: str, chat_id: str) -> bool:
         for k in stale:
             del _outbound_msgs[k]
         if len(_outbound_msgs) > 500:
-            _outbound_msgs.clear()
+            # Evict oldest half instead of clearing all — a blind .clear()
+            # would reset dedup for every in-flight message during a burst.
+            for k in list(_outbound_msgs.keys())[:250]:
+                del _outbound_msgs[k]
         if msg_hash in _outbound_msgs:
             return True
         _outbound_msgs[msg_hash] = now
