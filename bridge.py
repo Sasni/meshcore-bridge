@@ -799,16 +799,25 @@ async def on_advert(mc, event):
     p = event.payload
     if isinstance(p, dict) and p.get("public_key"):
         prefix = p["public_key"][:12]
-        ts = datetime.now().strftime("%H:%M")
+        ts = datetime.now().strftime("%d.%m %H:%M")
+        now = time.time()
+        NODE_MAX_AGE = 14 * 86400  # 14 dni
         with _state_lock:
             if prefix not in _seen_nodes:
-                _seen_nodes[prefix] = {"ts": ts, "lat": p.get("adv_lat"), "lon": p.get("adv_lon")}
+                _seen_nodes[prefix] = {"ts": ts, "seen_at": now, "lat": p.get("adv_lat"), "lon": p.get("adv_lon")}
                 new_node = True
+                # Usuń nody starsze niż 14 dni
+                cutoff = now - NODE_MAX_AGE
+                stale = [k for k, v in _seen_nodes.items() if v.get("seen_at", 0) < cutoff]
+                for k in stale:
+                    del _seen_nodes[k]
+                # Limit liczbowy jako fallback
                 if len(_seen_nodes) > _MAX_NODES:
                     for k in list(_seen_nodes.keys())[:_MAX_NODES // 3]:
                         del _seen_nodes[k]
             else:
                 _seen_nodes[prefix]["ts"] = ts
+                _seen_nodes[prefix]["seen_at"] = now
                 if p.get("adv_lat") is not None:
                     _seen_nodes[prefix]["lat"] = p.get("adv_lat")
                 if p.get("adv_lon") is not None:
