@@ -918,9 +918,14 @@ async def on_advert(mc, event):
                 stale = [k for k, v in _seen_nodes.items() if v.get("seen_at", 0) < cutoff]
                 for k in stale:
                     del _seen_nodes[k]
-                # Limit liczbowy jako fallback
+                # Limit liczbowy jako fallback — usuń najdawniej widziane.
+                # Sortowanie po seen_at, NIE po kolejności insertu w dict —
+                # aktywny node zaktualizowany niedawno zachowuje swoją
+                # oryginalną pozycję w słowniku, więc list(keys())[:N] nie
+                # oznacza "najstarsze wg aktywności".
                 if len(_seen_nodes) > _MAX_NODES:
-                    for k in list(_seen_nodes.keys())[:_MAX_NODES // 3]:
+                    sorted_nodes = sorted(_seen_nodes.items(), key=lambda item: item[1].get("seen_at", 0))
+                    for k, _ in sorted_nodes[:_MAX_NODES // 3]:
                         del _seen_nodes[k]
             else:
                 _seen_nodes[prefix]["ts"] = ts
