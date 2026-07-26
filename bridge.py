@@ -1982,15 +1982,17 @@ body{background:#0a0e13;color:#c9d3df;font:12px/1.7 'IBM Plex Mono',ui-monospace
 <body><pre>{lines}</pre></body></html>"""
 def build_status(mc) -> dict:
     with _state_lock:
-        node_list = sorted(_seen_nodes.keys())
+        # Snapshot the entire dict under one lock — on_advert can prune
+        # entries between acquisitions, causing KeyError on per-key access.
+        seen_snapshot = {k: dict(v) for k, v in _seen_nodes.items()}
         my_lat = _self_info.get("adv_lat")
         my_lon = _self_info.get("adv_lon")
         contacts_count = len(_contact_cache)
-        nodes_count = len(_seen_nodes)
+        nodes_count = len(seen_snapshot)
+    node_list = sorted(seen_snapshot.keys())
     nodes_with_dist = []
     for p in node_list:
-        with _state_lock:
-            nd = dict(_seen_nodes[p])
+        nd = seen_snapshot[p]
         if nd.get("lat") is not None and nd.get("lon") is not None and my_lat is not None and my_lon is not None:
             nd["dist"] = _haversine(my_lat, my_lon, nd["lat"], nd["lon"])
         else:
