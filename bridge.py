@@ -1071,9 +1071,11 @@ async def handle_tg_cmd(mc, text: str):
             await send_tg_html(
                 f"📶 <b>Kanal {ch}</b>\n"
                 f"Nazwa: {esc(name)}\n"
-                f"Sekret: {esc(secret_state)}\n"
-                f"Surowe: <code>{esc(str(c))}</code>"
+                f"Sekret: {esc(secret_state)}"
             )
+            # Raw payload logged locally for debugging — MUST NOT be sent
+            # to Telegram because c contains the channel encryption secret.
+            _log(f"Kanal {ch} surowe dane: {c}")
         except Exception as e:
             await send_tg(f"Blad: {e}")
         return
