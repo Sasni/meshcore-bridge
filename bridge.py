@@ -549,9 +549,9 @@ async def tg_api(method: str, payload: dict = None) -> dict | None:
         return None
 
 
-def _check_tg_dedup(text: str) -> bool:
-    """Return True if *text* is a duplicate within the dedup window (should skip)."""
-    msg_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+def _check_tg_dedup(text: str, chat_id: str) -> bool:
+    """Return True if *text* is a duplicate for the given *chat_id* within the dedup window."""
+    msg_hash = hashlib.sha256(f"{chat_id}:{text}".encode()).hexdigest()[:16]
     now = time.time()
     DEDUP_WINDOW = 300  # 5 minutes
     with _state_lock:
@@ -577,7 +577,7 @@ async def send_tg(text: str, chat_id: str = None) -> bool:
         chat_id = load_config().get("telegram", {}).get("chat_id", "")
     if not chat_id:
         return False
-    if _check_tg_dedup(text):
+    if _check_tg_dedup(text, chat_id):
         return True
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     r = await tg_api("sendMessage", {
@@ -601,7 +601,7 @@ async def send_tg_html(html: str, chat_id: str = None) -> bool:
         chat_id = load_config().get("telegram", {}).get("chat_id", "")
     if not chat_id:
         return False
-    if _check_tg_dedup(html):
+    if _check_tg_dedup(html, chat_id):
         return True
     r = await tg_api("sendMessage", {
         "chat_id": chat_id, "text": html,
