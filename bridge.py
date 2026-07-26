@@ -36,7 +36,6 @@ _MAX_NODES = 200
 _last_sender_name: str | None = None     # most recent sender
 _last_sender_key: str | None = None      # their pubkey prefix
 _outbound_msgs: dict[str, float] = {}  # msg_hash → timestamp
-_msg_acks: dict[str, set] = {}          # msg_text → set of repeater keys that acked
 _http: httpx.AsyncClient | None = None
 _mc_cmd_lock: asyncio.Lock | None = None
 _tg_offset: int = 0
@@ -842,10 +841,6 @@ async def on_ack(mc, event):
         key = p.get("from", "")[:8]
         text = p.get("text", "")
         if text and key:
-            with _state_lock:
-                if text not in _msg_acks:
-                    _msg_acks[text] = set()
-                _msg_acks[text].add(key)
             _log(f"ACK od {key}: {text[:40]}")
             # Update packet observer set by packet_id via id/fingerprint correlation.
             packet_id = None
@@ -861,12 +856,6 @@ async def on_ack(mc, event):
                     observers = None
             if packet_id and observers is not None:
                 await _db_update_packet_observers_async(packet_id, len(observers), ",".join(sorted(observers)))
-    # Cleanup old entries
-    with _state_lock:
-        if len(_msg_acks) > 100:
-            for k in list(_msg_acks.keys())[:50]:
-                del _msg_acks[k]
-
 
 async def on_self_info(mc, event):
     global _self_info, _last_rx_ts
@@ -2182,7 +2171,7 @@ async def start_web():
                 _log(f"-> kanal{ch}: {text[:60]}")
                 await send_tg_html(f"📤 <b>Kanal {ch}</b>\n{esc(text)}")
                 with _state_lock:
-                    ack_count = len(_msg_acks.get(text, set()))
+                    ack_count = len(_packet_observers.get(pid, set())) if pid else 0
                 return JSONResponse({"ok": True, "acks": ack_count})
             return JSONResponse({"error": r.payload.get("reason", "unknown") if r.payload else "unknown"})
         except Exception as e:
