@@ -1979,7 +1979,7 @@ body{background:#0a0e13;color:#c9d3df;font:12px/1.7 'IBM Plex Mono',ui-monospace
 .ts{color:#576172;margin-right:8px}
 </style>
 </head>
-<body><pre>""" + '{% for line in log %}<span class="ts">{{ line[:8] }}</span>{{ line[8:] }}\n{% endfor %}</pre></body></html>'
+<body><pre>{lines}</pre></body></html>"""
 def build_status(mc) -> dict:
     with _state_lock:
         node_list = sorted(_seen_nodes.keys())
@@ -2116,8 +2116,7 @@ async def start_web():
         with _state_lock:
             recent = list(_log_buffer)[-100:]
         lines = "".join(f'<span class="ts">{esc(l[:8])}</span>{esc(l[8:])}\n' for l in recent)
-        return HTMLResponse(LOG_HTML.replace("{% for line in log %}", "").replace("{% endfor %}", "")
-                           + "<pre>" + lines + "</pre></body></html>")
+        return HTMLResponse(LOG_HTML.replace("{lines}", lines))
 
     @app.get("/api/device/info")
     async def api_device_info():
