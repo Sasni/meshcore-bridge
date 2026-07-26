@@ -50,6 +50,7 @@ _log_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-log
 
 # Packet tracking
 _packet_observers: dict[int, set] = {}  # packet_id -> set of observer keys that acked
+_packet_observer_ts: dict[int, float] = {}  # packet_id -> time.monotonic() when observer set was created
 _packet_ack_targets: dict[str, int] = {}  # ack key -> packet_id
 _packet_recent_keys: dict[str, float] = {}  # fingerprint -> last seen monotonic ts
 _MAX_PACKETS = 500
@@ -740,15 +741,29 @@ async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_s
         if pid:
             with _state_lock:
                 if is_outbound:
-                    _packet_observers.setdefault(pid, set())
-                if len(_packet_observers) > 200:
-                    stale_ids = set(list(_packet_observers.keys())[:100])
-                    for packet_id in stale_ids:
+                    if pid not in _packet_observers:
+                        _packet_observers[pid] = set()
+                        _packet_observer_ts[pid] = now
+                # Time-based eviction: entries older than 30 min expire.
+                # Multi-hop mesh ACKs can arrive with significant delay.
+                OBSERVER_MAX_AGE = 1800  # 30 minutes
+                stale_ids = [pid2 for pid2, ts2 in list(_packet_observer_ts.items()) if now - ts2 > OBSERVER_MAX_AGE]
+                for packet_id in stale_ids:
+                    del _packet_observers[packet_id]
+                    del _packet_observer_ts[packet_id]
+                if stale_ids:
+                    for k, v in list(_packet_ack_targets.items()):
+                        if v in stale_ids:
+                            del _packet_ack_targets[k]
+                # Count-based safety net — keeps memory bounded under extreme load
+                if len(_packet_observers) > 500:
+                    oldest = set(sorted(_packet_observer_ts, key=lambda k: _packet_observer_ts[k])[:250])
+                    for packet_id in oldest:
                         del _packet_observers[packet_id]
-                    if stale_ids:
-                        for k, v in list(_packet_ack_targets.items()):
-                            if v in stale_ids:
-                                del _packet_ack_targets[k]
+                        del _packet_observer_ts[packet_id]
+                    for k, v in list(_packet_ack_targets.items()):
+                        if v in oldest:
+                            del _packet_ack_targets[k]
                 if len(_packet_ack_targets) > 500:
                     for k in list(_packet_ack_targets.keys())[:250]:
                         del _packet_ack_targets[k]
@@ -851,7 +866,9 @@ async def on_ack(mc, event):
                 if packet_id:
                     # Create observer set if _track_packet hasn't finished yet
                     # (covers the race window between DB insert and observer setup).
-                    _packet_observers.setdefault(packet_id, set())
+                    if packet_id not in _packet_observers:
+                        _packet_observers[packet_id] = set()
+                        _packet_observer_ts[packet_id] = time.monotonic()
                     _packet_observers[packet_id].add(key)
                     observers = _packet_observers[packet_id]
                 else:
