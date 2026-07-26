@@ -37,6 +37,7 @@ _last_sender_key: str | None = None      # their pubkey prefix
 _outbound_msgs: dict[str, float] = {}  # msg_hash → timestamp
 _msg_acks: dict[str, set] = {}          # msg_text → set of repeater keys that acked
 _http: httpx.AsyncClient | None = None
+_mc_cmd_lock: asyncio.Lock | None = None
 _tg_offset: int = 0
 _OFFSET_FILE = Path(CONFIG_PATH.parent, ".tg_offset")
 _MSG_FILE = Path(CONFIG_PATH.parent, ".msg_history.json")
@@ -49,6 +50,7 @@ _log_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="bridge-log
 # Packet tracking
 _packet_observers: dict[int, set] = {}  # packet_id -> set of observer keys that acked
 _packet_ack_targets: dict[str, int] = {}  # ack key -> packet_id
+_packet_recent_keys: dict[str, float] = {}  # fingerprint -> last seen monotonic ts
 _MAX_PACKETS = 500
 _send_datagram_fn = None  # set by main() for start_web() API endpoint
 _send_dm_ack_fn = None  # set by main() for handle_tg_cmd /r
@@ -99,6 +101,17 @@ def _rate_check(request, limit: int) -> bool:
     if len(_rate_limits) > 1000:
         _rate_limits.clear()
     return True
+
+
+async def _mc_call(coro, timeout: float = 5):
+    """Serialize MeshCore commands and apply a timeout.
+
+    Companion Protocol documentation recommends one command at a time.
+    """
+    if _mc_cmd_lock is None:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    async with _mc_cmd_lock:
+        return await asyncio.wait_for(coro, timeout=timeout)
 
 def esc(s: str) -> str:
     """Escape HTML entities in untrusted string."""
@@ -381,12 +394,18 @@ def _db_get_packets(limit: int = 100) -> list[dict]:
             "FROM packets ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         db.close()
         result = []
+        seen = set()
         for r in rows:
             d = dict(r)
             try:
                 d["raw_payload"] = json.loads(d["raw_payload"]) if d.get("raw_payload") else None
             except (json.JSONDecodeError, TypeError):
                 d["raw_payload"] = d.get("raw_payload")  # keep as string if malformed
+            ts_key = (d.get("ts") or "")[:16]
+            dedup_key = (d.get("sender") or "", d.get("sender_key") or "", d.get("ch") or "", d.get("text") or "", ts_key)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
             result.append(d)
         return result
     except Exception as e:
@@ -590,11 +609,34 @@ def _ack_lookup_keys(payload: dict) -> list[str]:
     return keys
 
 
+def _packet_fingerprint(sender: str, sender_key: str, text: str, ch: str, sender_timestamp=None, path_str: str = "") -> str:
+    """Build a stable fingerprint for packet deduplication."""
+    ts_part = ""
+    try:
+        if sender_timestamp is not None and str(sender_timestamp).strip() != "":
+            ts_part = str(int(float(sender_timestamp)))
+    except Exception:
+        ts_part = ""
+    if not ts_part:
+        ts_part = _payload_hash(path_str)
+    return f"{sender}|{sender_key}|{ch}|{ts_part}|{_payload_hash(text)}"
+
+
 # ── MeshCore handlers ────────────────────────────────────────
 
-async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_str: str, path_hops: int, snr, rssi):
+async def _track_packet(sender: str, sender_key: str, text: str, ch: str, path_str: str, path_hops: int, snr, rssi, sender_timestamp=None):
     """Record packet metadata to SQLite."""
     try:
+        now = time.monotonic()
+        fp = _packet_fingerprint(sender, sender_key, text, ch, sender_timestamp, path_str)
+        dedup_window_s = 180
+        stale_keys = [k for k, t in list(_packet_recent_keys.items()) if now - t > dedup_window_s]
+        for k in stale_keys:
+            del _packet_recent_keys[k]
+        if fp in _packet_recent_keys:
+            return None
+        _packet_recent_keys[fp] = now
+
         payload = json.dumps({"sender": sender, "ch": ch, "snr": snr, "rssi": rssi, "path": path_str})
         pid = await _db_insert_packet_async(sender, sender_key, text, ch, path_str, path_hops, snr, rssi, payload)
         # Track ACK observers only for outbound packets.
@@ -641,7 +683,7 @@ async def on_contact_message(mc, event):
     path_str = p.get("path", "")
     path_hops = len(path_str) // 12 if path_str else 0  # 12 hex chars per hop (6-byte pubkey prefix)
     rssi = p.get("RSSI", None)
-    await _track_packet(sender, pk, text, "DM", path_str, path_hops, snr, rssi)
+    await _track_packet(sender, pk, text, "DM", path_str, path_hops, snr, rssi, ts)
     await send_tg(msg)
 
 
@@ -680,7 +722,7 @@ async def on_channel_message(mc, event):
     rssi = p.get("RSSI", None)
     ch_snr = p.get("SNR", None)
     ch_label = f"CH{ch}"
-    await _track_packet(sender, pk, text, ch_label, path_str, path_hops, ch_snr, rssi)
+    await _track_packet(sender, pk, text, ch_label, path_str, path_hops, ch_snr, rssi, ts)
     await send_tg(msg)
 
 
@@ -784,7 +826,7 @@ async def handle_tg_cmd(mc, text: str):
     if text == "/status":
         bat = "?"
         try:
-            r = await mc.commands.get_bat()
+            r = await _mc_call(mc.commands.get_bat(), timeout=5)
             if r.type.name != "ERROR":
                 bat = r.payload.get("level", "?")
         except Exception:
@@ -798,7 +840,7 @@ async def handle_tg_cmd(mc, text: str):
         return
     if text == "/contacts":
         try:
-            r = await mc.commands.get_contacts()
+            r = await _mc_call(mc.commands.get_contacts(), timeout=10)
             contacts = r.payload or {} if r.type.name != "ERROR" else {}
             lines = [f"<b>Kontakty ({len(contacts)})</b>"]
             for key, c in list(contacts.items())[:20]:
@@ -812,7 +854,32 @@ async def handle_tg_cmd(mc, text: str):
         except Exception as e:
             await send_tg(f"Blad: {e}")
         return
-    if text == "/ch" or text.startswith("/ch ") or text.startswith("/channel") or text.startswith("/channel "):
+    if text == "/channel" or text.startswith("/channel "):
+        parts = text.split(maxsplit=1)
+        try:
+            ch = int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            await send_tg("Uzycie: /channel [nr]")
+            return
+        try:
+            r = await _mc_call(mc.commands.get_channel(ch), timeout=5)
+            if r.type.name == "ERROR":
+                await send_tg(f"Blad kanal{ch}: {r.payload.get('reason','?')}")
+                return
+            c = r.payload or {}
+            name = c.get("name", "") or c.get("channel_name", "") or "?"
+            secret = c.get("secret", "") or c.get("channel_secret", "")
+            secret_state = "publiczny" if secret and set(str(secret)) <= {"0"} else "ustawiony"
+            await send_tg(
+                f"📶 <b>Kanal {ch}</b>\n"
+                f"Nazwa: {esc(name)}\n"
+                f"Sekret: {esc(secret_state)}\n"
+                f"Surowe: <code>{esc(str(c))}</code>"
+            )
+        except Exception as e:
+            await send_tg(f"Blad: {e}")
+        return
+    if text == "/ch" or text.startswith("/ch "):
         parts = text.split(maxsplit=2)
         if len(parts) < 2:
             await send_tg("Uzycie: /ch <tekst> lub /ch <nr> <tekst>")
@@ -828,13 +895,13 @@ async def handle_tg_cmd(mc, text: str):
         try:
             txt = txt[:200]
             send_ts = int(time.time())
-            r = await mc.commands.send_chan_msg(ch, txt)
+            r = await _mc_call(mc.commands.send_chan_msg(ch, txt), timeout=5)
             if r.type.name == "ERROR":
                 await send_tg(f"Blad kanal{ch}: {r.payload.get('reason','?')}")
             else:
                 _log(f"-> kanal{ch}: {txt[:60]}")
                 await _push_msg("out", f"CH{ch}", "TG", txt)
-                pid = await _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None)
+                pid = await _track_packet("TG", "", txt, f"CH{ch}", "", 0, None, None, send_ts)
                 if pid:
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, txt, getattr(r, "payload", None))
                 await send_tg(f"📤 <b>Kanal {ch}</b>\n{esc(txt)}")
@@ -853,16 +920,28 @@ async def handle_tg_cmd(mc, text: str):
             target, key = _last_sender_name, _last_sender_key
             txt = parts[1]
         else:
-            target = parts[1]; txt = parts[2]
-            key = next((p for p, n in _contact_cache.items() if n.lower() == target.lower()), None)
+            rest = parts[1:]
+            key = None
+            target = ""
+            txt = " ".join(rest)
+            for split_at in range(len(rest) - 1, 0, -1):
+                candidate = " ".join(rest[:split_at])
+                candidate_txt = " ".join(rest[split_at:])
+                candidate_key = next((p for p, n in _contact_cache.items() if n.lower() == candidate.lower()), None)
+                if not candidate_key:
+                    try:
+                        c = await mc.get_contact_by_name(candidate)
+                        if c:
+                            candidate_key = c.get("public_key", "")[:12]
+                    except Exception as e:
+                        log.warning(f"/r: nie znaleziono kontaktu '{candidate}': {e}")
+                if candidate_key:
+                    target = candidate
+                    key = candidate_key
+                    txt = candidate_txt
+                    break
             if not key:
-                try:
-                    c = await mc.get_contact_by_name(target)
-                    if c: key = c.get("public_key", "")[:12]
-                except Exception as e:
-                    log.warning(f"/r: nie znaleziono kontaktu '{target}': {e}")
-            if not key:
-                await send_tg(f"Nie znaleziono: {target}")
+                await send_tg(f"Nie znaleziono kontaktu: {' '.join(rest[:-1])}")
                 return
         if not key:
             await send_tg("Brak klucza odbiorcy")
@@ -878,7 +957,7 @@ async def handle_tg_cmd(mc, text: str):
             else:
                 _log(f"-> do {target}: {txt[:60]}")
                 await _push_msg("out", "DM", target, txt)
-                pid = await _track_packet("TG", key, txt, "DM", "", 0, None, None)
+                pid = await _track_packet("TG", key, txt, "DM", "", 0, None, None, send_ts)
                 if pid:
                     _register_ack_target(pid, "DM", key, send_ts, txt, getattr(r, "payload", None))
                 await send_tg(f"📤 <b>Do {esc(target)}</b>\n{esc(txt)}")
@@ -1824,11 +1903,11 @@ async def start_web():
         try:
             result = {"self": _self_info}
             try:
-                phm = await asyncio.wait_for(_mc_ref.commands.get_path_hash_mode(), timeout=3)
+                phm = await _mc_call(_mc_ref.commands.get_path_hash_mode(), timeout=3)
                 result["self"]["path_hash_mode"] = phm
             except Exception:
                 pass
-            r = await asyncio.wait_for(_mc_ref.commands.send_device_query(), timeout=5)
+            r = await _mc_call(_mc_ref.commands.send_device_query(), timeout=5)
             if r.type.name != "ERROR":
                 _device_info = r.payload
                 _device_info_ts = time.time()
@@ -1844,7 +1923,7 @@ async def start_web():
         if not _mc_ref:
             return JSONResponse({"error": "Not connected"})
         try:
-            r = await _mc_ref.commands.send_advert(flood=False)
+            r = await _mc_call(_mc_ref.commands.send_advert(flood=False), timeout=5)
             ok = r.type.name != "ERROR"
             _log(f"Advert {'wyslany' if ok else 'BLAD'}")
             return JSONResponse({"ok": ok})
@@ -1859,7 +1938,7 @@ async def start_web():
         if not _mc_ref:
             return JSONResponse({"error": "Not connected"})
         try:
-            r = await asyncio.wait_for(_mc_ref.commands.get_contacts(), timeout=10)
+            r = await _mc_call(_mc_ref.commands.get_contacts(), timeout=10)
             if r.type.name != "ERROR":
                 contacts = r.payload or {}
                 _device_contact_count = len(contacts)
@@ -1951,10 +2030,10 @@ async def start_web():
             if len(text) > 200:
                 text = text[:200]
             send_ts = int(time.time())
-            r = await asyncio.wait_for(_mc_ref.commands.send_chan_msg(ch, text), timeout=5)
+            r = await _mc_call(_mc_ref.commands.send_chan_msg(ch, text), timeout=5)
             if r.type.name != "ERROR":
                 await _push_msg("out", f"CH{ch}", "JA", text)
-                pid = await _track_packet("JA", "", text, f"CH{ch}", "", 0, None, None)
+                pid = await _track_packet("JA", "", text, f"CH{ch}", "", 0, None, None, send_ts)
                 if pid:
                     _register_ack_target(pid, f"CH{ch}", "", send_ts, text, getattr(r, "payload", None))
                 _log(f"-> kanal{ch}: {text[:60]}")
@@ -2065,7 +2144,7 @@ async def start_web():
 
         async def _run(cmd_str, coro):
             try:
-                r = await asyncio.wait_for(coro, timeout=5)
+                r = await _mc_call(coro, timeout=5)
                 ok = r.type.name != "ERROR"
                 payload = r.payload if hasattr(r, "payload") else None
                 results.append({"action": cmd_str, "ok": ok, "payload": payload})
@@ -2091,7 +2170,7 @@ async def start_web():
             else:
                 await _run("set_coords", _mc_ref.commands.set_coords(lat, lon))
         if "devicepin" in body and body["devicepin"]:
-            await _run("set_devicepin", _mc_ref.commands.set_devicepin(str(body["devicepin"])))
+            await _run("set_devicepin", _mc_ref.commands.set_devicepin(int(body["devicepin"])))
         if "custom_var" in body and isinstance(body["custom_var"], dict):
             cv = body["custom_var"]
             await _run("set_custom_var",
@@ -2151,27 +2230,27 @@ async def start_web():
         out = {}
         cmds = _mc_ref.commands
         try:
-            r = await asyncio.wait_for(cmds.get_bat(), timeout=5)
+            r = await _mc_call(cmds.get_bat(), timeout=5)
             out["bat"] = _safe_json(r.payload if r.type.name != "ERROR" else None)
         except Exception:
             out["bat"] = None
         try:
-            r = await asyncio.wait_for(cmds.get_time(), timeout=5)
+            r = await _mc_call(cmds.get_time(), timeout=5)
             out["time"] = _safe_json(r.payload if r.type.name != "ERROR" else None)
         except Exception:
             out["time"] = None
         try:
-            r = await asyncio.wait_for(cmds.get_stats_core(), timeout=5)
+            r = await _mc_call(cmds.get_stats_core(), timeout=5)
             out["stats_core"] = _safe_json(r.payload if r.type.name != "ERROR" else None)
         except Exception:
             out["stats_core"] = None
         try:
-            r = await asyncio.wait_for(cmds.get_stats_radio(), timeout=5)
+            r = await _mc_call(cmds.get_stats_radio(), timeout=5)
             out["stats_radio"] = _safe_json(r.payload if r.type.name != "ERROR" else None)
         except Exception:
             out["stats_radio"] = None
         try:
-            r = await asyncio.wait_for(cmds.get_stats_packets(), timeout=5)
+            r = await _mc_call(cmds.get_stats_packets(), timeout=5)
             out["stats_packets"] = _safe_json(r.payload if r.type.name != "ERROR" else None)
         except Exception:
             out["stats_packets"] = None
@@ -2188,7 +2267,7 @@ async def start_web():
         now = time.time()
         if not _device_info or now - _device_info_ts > 300:
             try:
-                r = await asyncio.wait_for(_mc_ref.commands.send_device_query(), timeout=5)
+                r = await _mc_call(_mc_ref.commands.send_device_query(), timeout=5)
                 if r.type.name != "ERROR":
                     _device_info = r.payload
                     _device_info_ts = now
@@ -2198,7 +2277,7 @@ async def start_web():
         channels = []
         for idx in range(max_ch):
             try:
-                r = await asyncio.wait_for(_mc_ref.commands.get_channel(idx), timeout=5)
+                r = await _mc_call(_mc_ref.commands.get_channel(idx), timeout=5)
                 ch = _safe_json(r.payload) if r.type.name != "ERROR" else None
                 channels.append(ch)
             except Exception:
@@ -2211,7 +2290,7 @@ async def start_web():
 
 
 async def main():
-    global _http, _mc_ref
+    global _http, _mc_ref, _mc_cmd_lock
     _log("MeshCore <=> Telegram Bridge v5")
     _init_db()  # SQLite full history
     _load_msg_file()
@@ -2236,6 +2315,7 @@ async def main():
     mc = meshcore.MeshCore(conn, debug=(LOG_LEVEL == "DEBUG"),
                             auto_reconnect=True, max_reconnect_attempts=0)
     _mc_ref = mc
+    _mc_cmd_lock = asyncio.Lock()
 
     async def _send_dm_ack(dst_key: str, msg: str):
         """Send DM with need-ack flag (bit 0). ACK comes async via on_ack."""
@@ -2246,8 +2326,8 @@ async def main():
                 + ts.to_bytes(4, "little")            # timestamp
                 + dst_bytes                           # pubkey prefix (6 bytes)
                 + msg.encode("utf-8"))
-        return await mc.commands.send(data,
-            [meshcore.EventType.MSG_SENT, meshcore.EventType.ERROR])
+        return await _mc_call(mc.commands.send(data,
+            [meshcore.EventType.MSG_SENT, meshcore.EventType.ERROR]), timeout=5)
 
     async def _send_channel_datagram(channel: int, data_type: int, payload: bytes):
         """Send binary datagram to channel (CMD_SEND_CHANNEL_DATA 0x3E)."""
@@ -2256,8 +2336,8 @@ async def main():
                 + b"\xFF"                         # flood
                 + data_type.to_bytes(2, "little")
                 + payload)
-        return await mc.commands.send(data,
-            [meshcore.EventType.OK, meshcore.EventType.ERROR])
+        return await _mc_call(mc.commands.send(data,
+            [meshcore.EventType.OK, meshcore.EventType.ERROR]), timeout=5)
     global _send_datagram_fn, _send_dm_ack_fn
     _send_datagram_fn = _send_channel_datagram
     _send_dm_ack_fn = _send_dm_ack
@@ -2296,6 +2376,16 @@ async def main():
             await asyncio.sleep(30)
             retries = 10
 
+    # Companion Protocol bootstrap per docs: app start and device clock sync.
+    try:
+        await _mc_call(mc.commands.send_appstart(), timeout=5)
+    except Exception as e:
+        _log(f"APP_START failed: {e}")
+    try:
+        await _mc_call(mc.commands.set_time(int(time.time())), timeout=5)
+    except Exception as e:
+        _log(f"SET_TIME failed: {e}")
+
     # Start auto-fetch: initializes library's internal event reader
     # that dispatches CONTACT_MSG_RECV, CHANNEL_MSG_RECV, ADVERTISEMENT, ACK.
 
@@ -2330,14 +2420,14 @@ async def main():
     async def _load_channels():
         import asyncio as _asyncio
         try:
-            r = await _asyncio.wait_for(mc.commands.send_device_query(), timeout=5)
+            r = await _mc_call(mc.commands.send_device_query(), timeout=5)
             max_ch = r.payload.get("max_channels", 40) if r.payload else 40
         except Exception:
             max_ch = 40
         loaded = 0
         for idx in range(max_ch):
             try:
-                await _asyncio.wait_for(mc.commands.get_channel(idx), timeout=2)
+                await _mc_call(mc.commands.get_channel(idx), timeout=2)
                 loaded += 1
             except Exception:
                 pass
@@ -2358,7 +2448,7 @@ async def main():
             _msg_waiting.clear()
             try:
                 if mc.is_connected:
-                    r = await mc.commands.get_msg()
+                    r = await _mc_call(mc.commands.get_msg(timeout=5), timeout=6)
                     if r is not None and r.type.name != "ERROR":
                         _last_rx_ts = time.time()
             except Exception as e:
@@ -2376,7 +2466,7 @@ async def main():
             await asyncio.sleep(60)
             try:
                 # Active ping — get_time with timeout detects dead TCP
-                r = await asyncio.wait_for(mc.commands.get_time(), timeout=8)
+                r = await _mc_call(mc.commands.get_time(), timeout=8)
                 if r is not None and r.type.name != "ERROR":
                     _last_rx_ts = time.time()
                     fails = 0
@@ -2409,7 +2499,7 @@ async def main():
     # Pre-populate device info cache
     global _device_info_ts, _device_contact_count
     try:
-        r = await asyncio.wait_for(mc.commands.send_device_query(), timeout=5)
+        r = await _mc_call(mc.commands.send_device_query(), timeout=5)
         if r.type.name != "ERROR":
             _device_info = r.payload
             _device_info_ts = time.time()
@@ -2417,7 +2507,7 @@ async def main():
         pass
     # Pre-populate device contact count
     try:
-        r = await asyncio.wait_for(mc.commands.get_contacts(), timeout=10)
+        r = await _mc_call(mc.commands.get_contacts(), timeout=10)
         if r.type.name != "ERROR" and r.payload:
             _device_contact_count = len(r.payload)
     except Exception:
@@ -2426,8 +2516,8 @@ async def main():
     # Run Telegram polling concurrently
     poll_task = asyncio.create_task(tg_poll_loop(mc))
 
+    tasks = [poll_task, web_task]
     try:
-        tasks = [poll_task, web_task]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         # If any task finished (exception or normal exit), cancel the other
         for t in tasks:
@@ -2442,7 +2532,9 @@ async def main():
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        mc.stop_auto_message_fetching()
+        maybe_stop = mc.stop_auto_message_fetching()
+        if asyncio.iscoroutine(maybe_stop):
+            await maybe_stop
         await mc.disconnect()
         await _http.aclose()
         _log("Bridge zatrzymany")

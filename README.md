@@ -49,7 +49,7 @@ Web UI dostępne pod `http://<ip-raspberry>:8080` — czat, mapa nodów, panel k
 | Komenda | Działanie |
 |---|---|
 | `/r <tekst>` | Odpowiedz ostatniemu nadawcy |
-| `/r <nazwa> <tekst>` | Odpowiedz konkretnemu kontaktowi (obsługa nazw wielowyrazowych) |
+| `/r <nazwa> <tekst>` | Odpowiedz konkretnemu kontaktowi po dokładnym dopasowaniu nazwy, także wielowyrazowej |
 | `/ch <tekst>` | Wyślij na kanał 0 (#public) |
 | `/ch <nr> <tekst>` | Wyślij na konkretny kanał |
 | `/channel [nr]` | Pokaż info o kanale (czy zaszyfrowany, nazwa) |
@@ -116,6 +116,7 @@ meshcore-proxy ──TCP──► meshcore-telegram-bridge.py ──HTTPS──�
                               ├── _contact_cache (nazwy kontaktów)
                               ├── _seen_nodes (nody w zasięgu)
                               ├── _last_sender (do szybkiego reply)
+                              ├── APP_START + SET_TIME bootstrap
                               ├── Rate limiter (sliding window)
                               └── Stan zapisywany na dysk (JSON, atomic write)
 ```
